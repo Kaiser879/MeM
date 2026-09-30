@@ -472,6 +472,66 @@ func runCLI(t *testing.T, args ...string) (failed bool) {
 	return run(append([]string{"--db", db}, args...)) != nil
 }
 
+// TestNoMatchNamesTextFreeFiles covers the dead end that cost real debugging
+// time. Searching a folder of screenshots for "dragon" returns nothing, and
+// the files are not broken and the search is not wrong: they hold no words.
+// Without naming that population the only advice offered is "try fewer or more
+// general words", which cannot possibly work.
+func TestNoMatchNamesTextFreeFiles(t *testing.T) {
+	store := newTestStore(t)
+
+	// One document with text, three with none: the shape of a screenshots
+	// folder next to some notes.
+	seedFiles(t, store, fileSpec{name: "notes.pdf", content: "quantum mechanics"})
+	for _, name := range []string{"a.png", "b.png", "c.png"} {
+		fi := FileInfo{Path: "/test/" + name, Filename: name, Ext: ".png",
+			Size: 100, ModifiedAt: time.Now().Unix()}
+		if err := store.Upsert(fi, "", "meta", "Images", "sha"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, pq, err := store.Search("dragon", 5, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected no match, got %d results", len(rows))
+	}
+	if pq.unsearchable != 3 {
+		t.Fatalf("expected 3 text-free files to be counted, got %d", pq.unsearchable)
+	}
+
+	out := captureStdout(t, func() { printNoMatch("dragon", pq, 4) })
+	for _, want := range []string{"3 indexed files", "no readable text", "filename"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no-match output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestNoMatchStaysQuietWhenEverythingHasText keeps the new paragraph from
+// becoming noise on an ordinary miss. If every indexed file has text, the
+// absence of text is not the explanation and must not be offered.
+func TestNoMatchStaysQuietWhenEverythingHasText(t *testing.T) {
+	store := newTestStore(t)
+	seedFiles(t, store, fileSpec{name: "one.pdf", content: "quantum mechanics"},
+		fileSpec{name: "two.pdf", content: "operating systems"})
+
+	_, pq, err := store.Search("zzzqqqxyzzy", 5, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pq.unsearchable != 0 {
+		t.Errorf("all files have text, so unsearchable should be 0, got %d", pq.unsearchable)
+	}
+
+	out := captureStdout(t, func() { printNoMatch("zzzqqqxyzzy", pq, 2) })
+	if strings.Contains(out, "no readable text") {
+		t.Errorf("text-free note should be absent when it does not apply:\n%s", out)
+	}
+}
+
 func TestNoMatchOutputNamesTheConstraint(t *testing.T) {
 	pq := parsedQuery{terms: []string{"nothing"}}
 	pq.extensions = []string{".pdf"}

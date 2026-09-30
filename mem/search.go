@@ -79,6 +79,11 @@ type parsedQuery struct {
 	// have matched if the time filter were removed. It exists only to make
 	// the failure message useful, and is never consulted for ranking.
 	blockedByDate int
+
+	// unsearchable is set by Search on a miss: how many indexed files we hold
+	// metadata for but no text, so they can never match a content query. Also
+	// only used to make the failure message useful.
+	unsearchable int
 }
 
 // timeWords are consumed by the time-hint parser. Once "last week" has been
@@ -312,6 +317,14 @@ func (s *Store) Search(rawQuery string, limit int, filterExt string) ([]result, 
 	loose.window = timeWindow{}
 	if n, err := s.queryFTS(loose, 5); err == nil {
 		pq.blockedByDate = len(n)
+	}
+	// Also check how much of the index is metadata-only. Asking for "dragon"
+	// against a folder of photographs returns nothing, and without this the
+	// message is "try fewer or more general words" — advice that cannot
+	// possibly work, because the files hold no words at all. Both extra
+	// queries run only after a miss, so a successful search pays nothing.
+	if n, err := s.CountUnsearchable(); err == nil {
+		pq.unsearchable = n
 	}
 	return nil, pq, nil
 }
@@ -667,6 +680,20 @@ func printNoMatch(query string, pq parsedQuery, total int) {
 		}
 		fmt.Printf("\nYour words match %d %s, but outside the date range you asked for.\n",
 			pq.blockedByDate, noun)
+	}
+
+	// Name the one class of file that can never answer a content query, so a
+	// user searching for what a picture depicts learns the boundary instead of
+	// concluding the tool is broken. mem finds words inside files, including
+	// words inside images; it does not recognise subjects.
+	if pq.unsearchable > 0 {
+		if pq.unsearchable == 1 {
+			fmt.Printf("\n1 indexed file has no readable text, so it is findable only by filename.\n")
+		} else {
+			fmt.Printf("\n%d indexed files have no readable text, so they are findable only by filename.\n",
+				pq.unsearchable)
+		}
+		fmt.Println("Searching for what an image shows is outside what text search can do.")
 	}
 
 	// The most common cause of a zero result is a constraint the user forgot

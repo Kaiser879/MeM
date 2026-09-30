@@ -268,6 +268,22 @@ func (s *Store) Count() (int, error) {
 	return n, err
 }
 
+// CountUnsearchable is how many indexed files we hold metadata for but no text:
+// scanned PDFs, images where OCR found nothing worth indexing, and formats we
+// cannot read at all.
+//
+// This is the population that makes a correct search look broken. Someone asks
+// for "dragon" in a folder of photographs and gets an empty result, which is
+// accurate — none of those files contain the word — but explains nothing. The
+// count turns a dead end into a diagnosis.
+func (s *Store) CountUnsearchable() (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM files WHERE content IS NULL OR TRIM(content) = ''`,
+	).Scan(&n)
+	return n, err
+}
+
 // related finds memories that overlap with a given file.
 //
 // The idea: pull the words that define a document, then look for other
