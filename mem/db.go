@@ -1,0 +1,321 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// schema creates the one table we index into plus the FTS5 search index.
+//
+// The FTS5 table is an "external content" index: files_fts stores only an
+// inverted index of words, not a second copy of the text. That keeps the
+// database small and means the two can never disagree about what a document
+// says. Triggers keep them in lockstep.
+const schema = `
+CREATE TABLE IF NOT EXISTS files (
+  id           INTEGER PRIMARY KEY,
+  path         TEXT    NOT NULL UNIQUE,
+  filename     TEXT    NOT NULL,
+  extension    TEXT,
+  dir          TEXT,
+  size         INTEGER,
+  modified_at  INTEGER,
+  indexed_at   INTEGER,
+  content      TEXT,
+  content_type TEXT,
+  category     TEXT,
+  sha256       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS files_category ON files(category);
+CREATE INDEX IF NOT EXISTS files_modified ON files(modified_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+  filename, path, category, content,
+  content='files', content_rowid='id',
+  tokenize='unicode61 remove_diacritics 2'
+);
+
+-- Mirror inserts, deletes and updates into the search index automatically,
+-- so no code path can index a file and forget to make it searchable.
+CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+  INSERT INTO files_fts(rowid, filename, path, category, content)
+  VALUES (new.id, new.filename, new.path, new.category, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+  INSERT INTO files_fts(files_fts, rowid, filename, path, category, content)
+  VALUES ('delete', old.id, old.filename, old.path, old.category, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+  INSERT INTO files_fts(files_fts, rowid, filename, path, category, content)
+  VALUES ('delete', old.id, old.filename, old.path, old.category, old.content);
+  INSERT INTO files_fts(rowid, filename, path, category, content)
+  VALUES (new.id, new.filename, new.path, new.category, new.content);
+END;
+`
+
+// Store wraps the database handle.
+type Store struct {
+	db   *sql.DB
+	path string
+}
+
+// DefaultDBPath is where the index lives. Kept out of the user's working
+// directory so `mem` never litters the folders it is scanning.
+func DefaultDBPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".mem", "index.db"), nil
+}
+
+// OpenStore opens (creating if needed) the database and applies the schema.
+// Running the schema on every launch means an old index file can never crash
+// a newer build of the program.
+func OpenStore(path string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create database directory: %w", err)
+	}
+
+	// busy_timeout stops a second `mem` invocation failing instantly while the
+	// first one still holds the write lock.
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// SQLite is happiest with one writer; this keeps concurrent reads safe.
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	return &Store{db: db, path: path}, nil
+}
+
+// Close releases the database handle.
+func (s *Store) Close() error { return s.db.Close() }
+
+// Path is where this store lives on disk.
+func (s *Store) Path() string { return s.path }
+
+// existingRecord is the minimal info needed to decide whether a file needs
+// re-reading. Deliberately tiny: the whole point is to avoid opening files.
+type existingRecord struct {
+	ID       int64
+	Size     int64
+	Modified int64
+	HasText  bool
+}
+
+// Lookup returns what we already know about a path, if anything.
+func (s *Store) Lookup(path string) (existingRecord, bool, error) {
+	var r existingRecord
+	var contentType sql.NullString
+	err := s.db.QueryRow(
+		`SELECT id, size, modified_at, content_type FROM files WHERE path = ?`, path,
+	).Scan(&r.ID, &r.Size, &r.Modified, &contentType)
+	if err == sql.ErrNoRows {
+		return r, false, nil
+	}
+	if err != nil {
+		return r, false, err
+	}
+	r.HasText = contentType.String != "" && contentType.String != "meta"
+	return r, true, nil
+}
+
+// Upsert inserts a file or refreshes it. It returns whether the stored row
+// actually changed, which drives the "unchanged files skipped" counter.
+func (s *Store) Upsert(fi FileInfo, content, contentType, category, sha string) error {
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`
+		INSERT INTO files
+			(path, filename, extension, dir, size, modified_at, indexed_at,
+			 content, content_type, category, sha256)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(path) DO UPDATE SET
+			filename    = excluded.filename,
+			extension   = excluded.extension,
+			dir         = excluded.dir,
+			size        = excluded.size,
+			modified_at = excluded.modified_at,
+			indexed_at  = excluded.indexed_at,
+			content     = excluded.content,
+			content_type= excluded.content_type,
+			category    = excluded.category,
+			sha256      = excluded.sha256`,
+		fi.Path, fi.Filename, fi.Ext, filepath.Dir(fi.Path), fi.Size, fi.ModifiedAt, now,
+		content, contentType, category, sha,
+	)
+	return err
+}
+
+// Forget removes a row. Only used when a file has genuinely vanished, and it
+// only deletes the database row — never the user's file.
+func (s *Store) Forget(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM files WHERE id = ?`, id)
+	return err
+}
+
+// Count is how many files we currently know about.
+func (s *Store) Count() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&n)
+	return n, err
+}
+
+// related finds memories that overlap with a given file.
+//
+// The idea: pull the words that define a document, then look for other
+// documents containing many of the same words. Overlapping vocabulary is a
+// good enough proxy for "these two are about the same thing" without
+// needing embeddings or a vector database.
+func (s *Store) related(query string) error {
+	var target result
+	err := s.db.QueryRow(`
+		SELECT id, filename, path, category, extension, size, modified_at, content_type
+		FROM files
+		WHERE filename LIKE ? OR path = ?
+		ORDER BY LENGTH(filename) LIMIT 1`, "%"+query+"%", expandHome(query)).
+		Scan(&target.ID, &target.Filename, &target.Path, &target.Category,
+			&target.Extension, &target.Size, &target.Modified, &target.ContentTy)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%q is not in the index; run 'mem scan <dir>' first", query)
+	}
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Memories related to %s\n\n", target.Filename)
+	fmt.Printf("  %s\n  category: %s · %s\n\n", prettyPath(target.Path),
+		target.Category, humanBytes(uint64(target.Size)))
+
+	// Take a sample of the target's own text, keep the words that are rare
+	// across the whole index, and find documents sharing those words.
+	terms := distinctiveTerms(s, target.ID)
+	if len(terms) == 0 {
+		fmt.Println("  (this file has no extracted text to compare on)")
+		return nil
+	}
+
+	rows, err := s.db.Query(`
+		SELECT f.id, f.filename, f.path, f.extension, f.size, f.modified_at
+		FROM files_fts
+		JOIN files f ON f.id = files_fts.rowid
+		WHERE files_fts MATCH ?
+		ORDER BY bm25(files_fts, 4.0, 1.0, 2.0, 3.0)
+		LIMIT 12`, ftsQuery(terms))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	shown := 0
+	for rows.Next() {
+		var r result
+		if err := rows.Scan(&r.ID, &r.Filename, &r.Path, &r.Extension,
+			&r.Size, &r.Modified); err != nil {
+			return err
+		}
+		if r.ID == target.ID {
+			continue
+		}
+		fmt.Printf("  %-44s %s · %s\n", truncate(r.Filename, 44),
+			humanBytes(uint64(r.Size)), timeAgo(r.Modified))
+		shown++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if shown == 0 {
+		fmt.Println("  (nothing else in the index shares vocabulary with this file)")
+	}
+	return nil
+}
+
+// distinctiveTerms picks the words that best characterise one document.
+//
+// The trick is frequency across the whole index: a word appearing in nearly
+// every file ("document", "pdf", "the") tells us nothing about this file,
+// whereas a word appearing in one or two is exactly what makes it distinct.
+// We sample the document's text, count each word's index-wide frequency, and
+// keep the rarest ones.
+func distinctiveTerms(s *Store, id int64) []string {
+	var content sql.NullString
+	if err := s.db.QueryRow(`SELECT content FROM files WHERE id = ?`, id).
+		Scan(&content); err != nil || !content.Valid || len(content.String) == 0 {
+		return nil
+	}
+
+	// Sample the opening of the document: the title page and contents page
+	// are the most identifying part, and this keeps the work bounded.
+	sample := content.String
+	if len(sample) > 20000 {
+		sample = sample[:20000]
+	}
+
+	// Count words within the sample, so a word repeated many times in one
+	// document does not drown out the others.
+	local := map[string]int{}
+	for _, w := range strings.Fields(strings.ToLower(sample)) {
+		w = strings.Trim(w, ".,;:!?()[]{}\"'`")
+		if len(w) >= 4 && !stopWords[w] {
+			local[w]++
+		}
+	}
+
+	// Ask the index how many documents contain each candidate word.
+	type cand struct {
+		word string
+		docs int
+	}
+	var cands []cand
+	for w := range local {
+		var docs int
+		// Counting documents that contain the word: a prefix search, so
+		// "syllab" also counts "syllabus".
+		if err := s.db.QueryRow(
+			`SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH ?`, `"`+w+`"*`,
+		).Scan(&docs); err != nil || docs == 0 {
+			continue
+		}
+		cands = append(cands, cand{word: w, docs: docs})
+	}
+
+	// Rarest first; ties broken alphabetically so output is reproducible.
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].docs != cands[j].docs {
+			return cands[i].docs < cands[j].docs
+		}
+		return cands[i].word < cands[j].word
+	})
+
+	out := make([]string, 0, 12)
+	for _, c := range cands {
+		if len(out) >= 12 {
+			break
+		}
+		out = append(out, c.word)
+	}
+	return out
+}
+
+// truncate shortens a string for aligned table output.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}

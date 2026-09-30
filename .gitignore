@@ -1,0 +1,12 @@
+# The compiled binary. Rebuild with: go build -o mem .
+mem/mem
+
+# The live index. It is a cache of your files, not your files:
+# delete it and the next scan rebuilds it. Never commit it.
+*.db
+*.db-wal
+*.db-shm
+
+# Stray tesseract output. An empty output base writes OCR garbage to a file
+# instead of stdout; this is what that looks like when it happens by accident.
+.mem-ocr-*
