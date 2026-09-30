@@ -473,6 +473,164 @@ func TestNoDateHintWhenNothingMatchedAnywhere(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Pruning deleted files.
+//
+// A row for a deleted file used to survive forever, and mem search would keep
+// returning it at 99% confidence. Nothing in the pipeline could remove a row,
+// so re-scanning did not help. These tests pin both the fix and, more
+// importantly, the two ways a prune could destroy live data.
+// ---------------------------------------------------------------------------
+
+// indexTempFile writes a real file and records it in the store, so the store
+// and the filesystem agree the way they do after a genuine scan.
+func indexTempFile(t *testing.T, s *Store, dir, name, body string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi := FileInfo{Path: p, Filename: name, Ext: filepath.Ext(name),
+		Size: st.Size(), ModifiedAt: st.ModTime().Unix()}
+	if err := s.Upsert(fi, body, "", documentCategory(name), "sha"); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestPruneRemovesDeletedFiles(t *testing.T) {
+	store := newTestStore(t)
+	dir := t.TempDir()
+
+	keep := indexTempFile(t, store, dir, "keep.txt", "quantum mechanics notes")
+	gone := indexTempFile(t, store, dir, "gone.txt", "operating system scheduling")
+
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	// The set the walk would have produced: keep was seen, gone was not.
+	pruned, err := store.PruneMissing(dir, map[string]bool{keep: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 1 || pruned[0] != gone {
+		t.Fatalf("expected only %s to be pruned, got %v", gone, pruned)
+	}
+
+	if _, found, _ := store.Lookup(keep); !found {
+		t.Error("the file still on disk must survive the prune")
+	}
+	if _, found, _ := store.Lookup(gone); found {
+		t.Error("the deleted file's row should be gone")
+	}
+}
+
+// TestPruneIsScopedToScannedRoot is the destructive-failure guard. The index is
+// shared across every folder ever scanned, so pruning ~/Downloads must never
+// reach into ~/Pictures. A bug here silently deletes a user's whole index for
+// one folder.
+func TestPruneIsScopedToScannedRoot(t *testing.T) {
+	store := newTestStore(t)
+	folderA := t.TempDir()
+	folderB := t.TempDir()
+
+	// Both are indexed, then both files are deleted. Only B is re-scanned.
+	deletedA := indexTempFile(t, store, folderA, "a.txt", "alpha quantum notes")
+	deletedB := indexTempFile(t, store, folderB, "b.txt", "bravo topology notes")
+	if err := os.Remove(deletedA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(deletedB); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, err := store.PruneMissing(folderB, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 1 || pruned[0] != deletedB {
+		t.Fatalf("scanning B should prune only B, got %v", pruned)
+	}
+
+	// A's file is gone from disk, but A was not the folder scanned. Its row
+	// must survive: a later scan of A will clean it up.
+	if _, found, _ := store.Lookup(deletedA); !found {
+		t.Error("pruning folder B deleted a row belonging to folder A")
+	}
+}
+
+// TestPruneKeepsFilesTheWalkSkipped pins the stat safety net. "Not seen by the
+// walk" does not mean "deleted": the walk skips files over 64 MiB, hidden
+// files, and everything under a hidden directory. Pruning on the walk's say-so
+// alone would delete rows for files sitting right there on disk.
+func TestPruneKeepsFilesTheWalkSkipped(t *testing.T) {
+	store := newTestStore(t)
+	dir := t.TempDir()
+
+	// Pretend this was indexed when it was small enough to read.
+	big := filepath.Join(dir, "huge.pdf")
+	if err := os.WriteFile(big, []byte("plant physiology"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi := FileInfo{Path: big, Filename: "huge.pdf", Ext: ".pdf",
+		Size: maxIndexableSize + 1, ModifiedAt: time.Now().Unix()}
+	if err := store.Upsert(fi, "", "meta", "College", "sha"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The walk skipped it (too large), so it is absent from the seen set.
+	pruned, err := store.PruneMissing(dir, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("a file that exists must never be pruned, got %v", pruned)
+	}
+	if _, found, _ := store.Lookup(big); !found {
+		t.Error("row for a skipped-but-present file was deleted")
+	}
+}
+
+// TestPruneRespectsSiblingPrefix guards the SQL. "substr" is used instead of
+// LIKE precisely because LIKE treats "_" as a single-character wildcard.
+//
+// The two directories below are identical except at the position where parent
+// has "_" and sibling has "X". That is the only arrangement that exposes the
+// bug: a LIKE pattern of parent+"/"+"%" treats the "_" as a one-character
+// wildcard, matches the "X", and then swallows everything under the sibling.
+// Suffix-style siblings (/tmp/a and /tmp/a_other) would not catch it, because
+// the path separator never lines up with the wildcard.
+func TestPruneRespectsSiblingPrefix(t *testing.T) {
+	store := newTestStore(t)
+	base := t.TempDir()
+	parent := filepath.Join(base, "a_b")
+	sibling := filepath.Join(base, "aXb") // differs exactly at the "_"
+
+	for _, d := range []string{parent, sibling} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	siblingFile := indexTempFile(t, store, sibling, "s.txt", "sibling folder notes")
+	if err := os.Remove(siblingFile); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, err := store.PruneMissing(parent, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("a sibling directory matching the prefix as a wildcard must not be pruned, got %v", pruned)
+	}
+}
+
 // newTestStore opens a throwaway store in a temp dir. Every test gets its own
 // database so they cannot interfere with each other, and nothing here can
 // touch the user's real index at ~/.mem/index.db.

@@ -169,6 +169,98 @@ func (s *Store) Forget(id int64) error {
 	return err
 }
 
+// PruneMissing deletes index rows for files under root that no longer exist,
+// returning the paths it removed.
+//
+// Why this exists: without it, deleting a file leaves its row behind forever.
+// mem search would keep returning it at 99% confidence, pointing at a path
+// that no longer resolves. Re-scanning did not help, because a walk only ever
+// adds and updates rows — nothing in the pipeline could remove one. Forget was
+// written for this and never wired up, so the tool could confidently cite a
+// file the user had thrown away.
+//
+// Scoping is the part that must not be wrong. The index is shared across every
+// folder ever scanned, keyed by absolute path, so scanning ~/Downloads must
+// never disturb a row from ~/Pictures. Only rows under root are candidates.
+//
+// A row is removed only when two conditions hold:
+//
+//  1. the walk did not see the path this pass, and
+//  2. os.Stat reports the file is gone.
+//
+// The second is not redundant. The walk deliberately skips files over 64 MiB,
+// hidden files, and anything under a hidden directory, so "not seen" alone
+// would delete rows for files still sitting on disk. The stat is the
+// tie-breaker, and it only runs on rows that already failed the first test, so
+// the common case costs nothing.
+func (s *Store) PruneMissing(root string, seen map[string]bool) ([]string, error) {
+	// substr, not LIKE: LIKE treats "_" as a single-character wildcard, and
+	// any real path may contain one. This compares a fixed-length prefix
+	// instead, so "/a/b" cannot accidentally match "/a/b_c".
+	prefix := root + string(filepath.Separator)
+	rows, err := s.db.Query(
+		`SELECT id, path FROM files WHERE path = ? OR substr(path, 1, ?) = ?`,
+		root, len(prefix), prefix,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var ids []int64
+	var gone []string
+	for rows.Next() {
+		var id int64
+		var p string
+		if err := rows.Scan(&id, &p); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if seen[p] {
+			continue
+		}
+		// Only "does not exist" counts. A stat that fails for any other
+		// reason (permissions, a vanished network mount) leaves the row
+		// alone, because we have not proved the file is gone.
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			continue
+		}
+		ids = append(ids, id)
+		gone = append(gone, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	// One transaction, so a failure part-way leaves the index as it was rather
+	// than half-pruned. The DELETE fires files_ad, which drops the FTS entry
+	// in the same breath — there is no second thing to remember to do.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once Commit succeeds
+
+	stmt, err := tx.Prepare(`DELETE FROM files WHERE id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+
+	for _, id := range ids {
+		if _, err := stmt.Exec(id); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return gone, nil
+}
+
 // Count is how many files we currently know about.
 func (s *Store) Count() (int, error) {
 	var n int

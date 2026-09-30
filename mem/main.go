@@ -122,6 +122,15 @@ func cmdScan(args []string, dbPath string) error {
 
 	var indexed, extracted, unchanged int
 	resetOCRStats()
+
+	// Every path the walk produced, including the ones we are about to skip as
+	// unchanged. PruneMissing compares against this set to spot rows whose
+	// files have since been deleted.
+	seen := make(map[string]bool, len(files))
+	for _, fi := range files {
+		seen[fi.Path] = true
+	}
+
 	for _, fi := range files {
 		// Skip work entirely when size and mtime match what we stored. This
 		// is what makes a second scan feel instant.
@@ -156,6 +165,19 @@ func cmdScan(args []string, dbPath string) error {
 		indexed++
 	}
 
+	// Drop rows for files that have been deleted since the last scan. Scoped to
+	// the folder just walked, and only reached because Scan returned without
+	// error — a walk that could not read the tree tells us nothing about what is
+	// missing from it, so pruning on a partial walk would delete live rows.
+	absRoot, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	pruned, err := store.PruneMissing(absRoot, seen)
+	if err != nil {
+		return fmt.Errorf("prune missing files: %w", err)
+	}
+
 	fmt.Printf("Indexed %d files\n", indexed)
 	fmt.Printf("Extracted text from %d files\n", extracted)
 	if ocrCounts.used > 0 {
@@ -169,6 +191,18 @@ func cmdScan(args []string, dbPath string) error {
 		fmt.Println("OCR not installed: images are indexed by name only")
 	}
 	fmt.Printf("Skipped %d unchanged files\n", unchanged)
+	if len(pruned) > 0 {
+		// Removal is reported, never silent. Silently dropping index rows would
+		// make search results change with no explanation for it.
+		fmt.Printf("Removed %d file(s) that are no longer on disk\n", len(pruned))
+		for i, p := range pruned {
+			if i == 3 {
+				fmt.Printf("  ... and %d more\n", len(pruned)-3)
+				break
+			}
+			fmt.Printf("  %s\n", prettyPath(p))
+		}
+	}
 	if stats.SkippedLarge > 0 {
 		fmt.Printf("Skipped %d files over %d MB\n", stats.SkippedLarge, maxIndexableSize>>20)
 	}
