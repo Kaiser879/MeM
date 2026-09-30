@@ -245,6 +245,68 @@ func TestOCRQualityGate(t *testing.T) {
 	}
 }
 
+// TestOCRVerdictSeparatesNoTextFromNoise pins the distinction the scan report
+// depends on.
+//
+// Both cases used to be reported as "unreadable noise", which is actively
+// misleading. A picture of a dragon produces two or three stray characters:
+// there is nothing to read, and no threshold change will ever find it. A
+// handwriting sample produces hundreds of characters that are not prose: the
+// reading failed. Telling a user the second when it was the first sends them
+// to tune a threshold that cannot help, which is exactly the wrong advice for a
+// file that contains no words.
+func TestOCRVerdictSeparatesNoTextFromNoise(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want ocrVerdict
+	}{
+		{
+			// Measured: the dragon screenshot OCRs to these three characters
+			// at 150, 300 and 600 DPI, across five page-segmentation modes,
+			// and under inversion and upscaling. There is no text in it.
+			name: "wordless image is no text, not noise",
+			text: "e 2 -",
+			want: ocrNothing,
+		},
+		{
+			name: "empty output is no text",
+			text: "",
+			want: ocrNothing,
+		},
+		{
+			// Measured: a WhatsApp contact screenshot. Legible, but names and
+			// phone numbers are not prose, so the English-word gate refuses
+			// them (func ratio 0.070-0.084 against a floor of 0.18).
+			name: "contact list is noise, not absence",
+			text: "Aniket Vidhated +9152702 50821 Dhruv Meher +9178219 37897 " +
+				"Dheeraj +9189990 39821 Janhavi Bandekar 49193220 12637",
+			want: ocrNoise,
+		},
+		{
+			name: "handwriting fragments are noise",
+			text: "T ——— s AR R R gory BEE (HW) AWK Jntméh 'Jofor'ci(&c(t} " +
+				"'j(g(ill?ié> .fid = i] — Watt (w). - S <7 Joudes C 7).",
+			want: ocrNoise,
+		},
+		{
+			name: "real prose is readable",
+			text: "Naming Convention. Service units carry a .service extension. " +
+				"Every service has a descriptive name, and the name usually " +
+				"makes the purpose of the service obvious.",
+			want: ocrReadable,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := classifyOCR(c.text); got != c.want {
+				t.Errorf("classifyOCR() = %v, want %v\ntext: %.90q", got, c.want, c.text)
+			}
+		})
+	}
+}
+
 func TestOCRDegradesGracefullyWithoutEngine(t *testing.T) {
 	// The contract that matters most for portability: with no OCR engine
 	// present, an image yields no text and no panic. Never an error that

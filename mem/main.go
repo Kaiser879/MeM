@@ -181,11 +181,14 @@ func cmdScan(args []string, dbPath string) error {
 	fmt.Printf("Indexed %d files\n", indexed)
 	fmt.Printf("Extracted text from %d files\n", extracted)
 	if ocrCounts.used > 0 {
-		// Report OCR coverage precisely: how many images yielded text, how
-		// many were unreadable, and how many produced noise we discarded.
-		// Reporting a single blended number would overstate what happened.
-		fmt.Printf("OCR'd %d images: %d readable, %d no text, %d unreadable noise\n",
-			ocrCounts.used, ocrIndexed, ocrCounts.empty, ocrCounts.rejected)
+		// Report OCR coverage precisely, and keep "found no words" separate
+		// from "found words that were not prose". They are different problems
+		// with opposite responses: an image with no words in it will never be
+		// found by searching for what it depicts, however many times it is
+		// re-scanned, and reporting it as unreadable noise invites a threshold
+		// change that cannot help.
+		fmt.Printf("OCR'd %d images: %d readable, %d with no text, %d unreadable noise\n",
+			ocrCounts.used, ocrCounts.readable, ocrCounts.nothing, ocrCounts.noise)
 	}
 	if !ocrEnabled() {
 		fmt.Println("OCR not installed: images are indexed by name only")

@@ -245,26 +245,25 @@ var ocrEnabled = sync.OnceValue(func() bool {
 
 // ocrStats records what OCR did, so scan can report coverage honestly rather
 // than implying every image was read successfully.
+//
+// The four outcomes are kept apart because they are four different situations
+// with four different responses, and merging them is what made the report
+// useless. An image with no words in it is not a failure: no threshold, no
+// rescan and no OCR engine will ever find text in a picture of a dragon. Text
+// that was read but turned out not to be prose is a different thing entirely.
 type ocrStats struct {
-	used     int // images that produced indexable text
-	rejected int // images the engine read but whose output was noise
-	empty    int // images with no text at all
+	used     int // images we ran the engine on
+	readable int // yielded real text: indexed and searchable
+	nothing  int // engine returned too little to judge: the image has no words
+	noise    int // text was read, but it was not prose
 }
 
 var ocrCounts = ocrStats{}
-
-// ocrRejects is the subset of OCR attempts that produced noise.
-var ocrRejects int
-
-// ocrIndexed counts images that yielded text good enough to index.
-var ocrIndexed int
 
 // resetOCRStats clears the per-scan OCR counters. Without this, a second scan
 // would report the first scan's numbers.
 func resetOCRStats() {
 	ocrCounts = ocrStats{}
-	ocrRejects = 0
-	ocrIndexed = 0
 }
 
 // extractImageOCR reads text out of a raster image, returning "" when it
@@ -298,21 +297,23 @@ func extractImageOCR(path string) string {
 	}
 
 	text := capText(string(out))
-	if text == "" {
-		// Nothing was read at all: an image with no text, or a page that
-		// failed to parse. Not a rejection, just nothing to say.
-		ocrCounts.empty++
-		return ""
+	switch classifyOCR(text) {
+	case ocrReadable:
+		ocrCounts.readable++
+		return text
+	case ocrNothing:
+		// The engine ran and found no words to speak of. A photograph of an
+		// object, a logo, a screenshot of an icon. Nothing is wrong here and
+		// nothing would fix it, so it is reported as its own outcome rather
+		// than as a rejection.
+		ocrCounts.nothing++
+	case ocrNoise:
+		// The engine read a lot of characters and they were not prose. Real
+		// text came out garbled, or handwriting, or a contact list. Counting
+		// it keeps scan honest about coverage.
+		ocrCounts.noise++
 	}
-	if !looksLikeReadableText(text) {
-		// The engine produced output but it is not real text. Counting it
-		// keeps scan honest about coverage.
-		ocrCounts.rejected++
-		ocrRejects++
-		return ""
-	}
-	ocrIndexed++
-	return text
+	return ""
 }
 
 // Thresholds for the OCR quality gate.
@@ -333,10 +334,29 @@ const (
 	ocrWordRatioFloor = 0.30
 )
 
-// looksLikeReadableText decides whether OCR output is real text or noise.
+// ocrVerdict is the gate's conclusion about one image's text.
+type ocrVerdict int
+
+const (
+	ocrReadable ocrVerdict = iota // real prose: index it
+	ocrNothing                    // too little output to judge: no words in the image
+	ocrNoise                      // text was read, but it is not prose
+)
+
+// minOCRTokens is the smallest sample that can tell a label from a fragment.
+// Below it the gate refuses to guess in either direction.
+const minOCRTokens = 4
+
+// classifyOCR decides whether OCR output is real text, absent, or noise.
 //
-// The signal is the share of "word-shaped" tokens: things that are 3-18
-// characters long, contain a vowel, and are not shouting in all capitals.
+// The distinction between "absent" and "noise" is the whole point of returning
+// a verdict rather than a bool. Both used to be reported as unreadable, which
+// sent a user looking for a threshold that could not exist: a picture of a
+// dragon has no words in it, and no amount of loosening the gate will find
+// them. The two cases need opposite responses, so they must not share a label.
+//
+// The noise test itself is the share of "word-shaped" tokens: things that are
+// 3-18 characters long, contain a vowel, and are not shouting in all capitals.
 // Genuine English prose is overwhelmingly made of such tokens. OCR noise is
 // dominated by fragments, initialisms and consonant clusters ("AWK", "HW",
 // "gory").
@@ -344,14 +364,17 @@ const (
 // A second, cheaper signal guards the long tail: real prose contains common
 // English function words, because sentences are mostly short connective words
 // and pronouns. Noise almost never does.
-func looksLikeReadableText(s string) bool {
+func classifyOCR(s string) ocrVerdict {
 	tokens := strings.FieldsFunc(s, func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	})
-	// Too little text to judge. Three words is the smallest sample that can
-	// distinguish a label from a fragment.
-	if len(tokens) < 4 {
-		return false
+	// Too little text to judge either way. This is the "the image has no
+	// words" case, not the "the engine produced garbage" case: tesseract
+	// returns two or three stray characters for a picture of an object, and
+	// calling that noise implies the reading failed when there was nothing
+	// to read.
+	if len(tokens) < minOCRTokens {
+		return ocrNothing
 	}
 
 	wordish, functionish := 0, 0
@@ -367,11 +390,20 @@ func looksLikeReadableText(s string) bool {
 	// Function words are the primary signal. Real prose is roughly 30-50%
 	// function words; OCR noise from handwriting or graphics is single-digit.
 	if float64(functionish)/float64(len(tokens)) < ocrFuncRatioFloor {
-		return false
+		return ocrNoise
 	}
 	// Word-shape is the secondary floor: catches output where nearly every
 	// token is a fragment but one happened to be a common word.
-	return float64(wordish)/float64(len(tokens)) >= ocrWordRatioFloor
+	if float64(wordish)/float64(len(tokens)) < ocrWordRatioFloor {
+		return ocrNoise
+	}
+	return ocrReadable
+}
+
+// looksLikeReadableText is the boolean form of classifyOCR, kept because the
+// two thresholds are the decision and a bare bool is the easiest thing to test.
+func looksLikeReadableText(s string) bool {
+	return classifyOCR(s) == ocrReadable
 }
 
 // isWordShaped reports whether a token looks like an English word rather than
