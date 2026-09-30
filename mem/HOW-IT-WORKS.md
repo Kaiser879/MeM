@@ -344,15 +344,38 @@ not balanced on a knife edge. `isWordShaped` survives as a secondary floor at
 0.30 to catch short fragment output; `TestOCRQualityGate` pins both real cases
 so nobody "simplifies" the gate back into rejecting good text.
 
-`scan` then reports the split rather than a flattering single number:
+#### Two rejections, not one
+
+`classifyOCR` returns a three-way verdict, because "the engine read this and it
+was garbage" and "there was nothing here to read" need opposite responses from
+the user:
+
+| Verdict | Means | What to do about it |
+|---|---|---|
+| `ocrReadable` | real prose | nothing, it is indexed |
+| `ocrNothing` | fewer than 4 tokens came back | nothing — the image has no words |
+| `ocrNoise` | text was read, but not prose | the source is hard to read |
+
+Measured on the same screenshot folder: a picture of a dragon returns three
+characters (`e 2 -`) at 150, 300 **and** 600 DPI, across five
+page-segmentation modes, inverted and upscaled. There is no text in it. A
+WhatsApp contact list returns 600 characters of names and phone numbers —
+legible, but function-word share 0.070–0.084 against a floor of 0.18.
+
+Reporting both as "unreadable noise" was the bug: it tells a user to go tune a
+threshold, when for a wordless image no threshold on earth will help. That
+distinction is worth more than a better OCR engine.
+
+`scan` reports all four counters separately rather than one flattering number:
 
 ```
-OCR'd 13 images: 1 readable, 1 no text, 11 unreadable noise
+OCR'd 5 images: 1 readable, 2 with no text, 2 unreadable noise
 ```
 
 **The honest result: OCR reads printed text — screenshots, chat images,
-photographed slides. It does not read handwriting.** Handwriting recognition is
-a genuinely hard problem, and saying so beats pretending.
+photographed slides. It does not read handwriting, and it cannot tell you what
+a picture depicts.** Handwriting recognition is a genuinely hard problem, and
+saying so beats pretending.
 
 ### Stage 4: write the row
 
@@ -363,18 +386,53 @@ trigger fires automatically; there is no second write to forget.
 `hashFile` computes SHA-256. Honest caveat: it is stored, but **nothing currently
 reads it** for deduplication. Stated rather than implied.
 
+### Stage 4b: forget files that are gone
+
+A walk can only add and update rows. Nothing in the pipeline could remove one,
+so deleting a file left its row behind **forever** — and `mem search` kept
+returning it, at 99% confidence, pointing at a path that no longer resolved.
+Re-scanning did not help. `Forget()` was written for exactly this and had no
+call site.
+
+The fix, `PruneMissing`, runs after indexing and only when the walk succeeded
+(a partial walk tells you nothing about what is missing from it). A row is
+removed only when **two** conditions hold:
+
+1. the walk did not see the path this pass, **and**
+2. `os.Stat` reports the file is gone.
+
+The second condition is not redundant, and it is the part that makes this safe
+to run on real folders. The walk deliberately skips files over 64 MiB, hidden
+files, and everything under a hidden directory, so "not seen" alone would
+delete rows for files sitting right there on disk. Any stat failure *other* than
+`NotExist` — permissions, a vanished network mount — leaves the row alone,
+because we have not proved the file is gone.
+
+Scoping uses `substr(path, 1, N) = root` rather than `LIKE`, because `LIKE`
+treats `_` as a single-character wildcard and a sibling directory can match a
+prefix by coincidence: `/tmp/a_b` would also match `/tmp/aXb`. Only rows under
+the folder you just scanned are candidates, so scanning `~/Downloads` can never
+disturb `~/Pictures`.
+
+Deletion runs in one transaction and fires `files_ad`, so the FTS entry is
+dropped in the same statement. There is no second thing to remember.
+
 ### Stage 5: report
 
 ```
 Indexed 46 files
 Extracted text from 31 files
-OCR'd 13 images: 1 readable, 1 no text, 11 unreadable noise
+OCR'd 5 images: 1 readable, 2 with no text, 2 unreadable noise
 Skipped 0 unchanged files
 Skipped 1 files over 64 MB
+Removed 1 file(s) that are no longer on disk
+  ~/Downloads/old.pdf
 ```
 
 Every number is a real count, including the unflattering ones. `extracted`
 counts only files where `kind != "meta"` — i.e. text was actually recovered.
+Removal is always reported, never silent: index rows disappearing with no
+explanation would be its own kind of untrustworthy.
 
 ---
 
@@ -582,6 +640,34 @@ Your words match 3 files, but outside the date range you asked for.
 
 The words were right; the date was too narrow. That is a far more useful failure
 than a blank screen, and it names the constraint the user forgot they typed.
+
+**The other dead end: files with no text at all.** The second extra query on
+the same cold path counts indexed files we hold metadata for but no text.
+
+```
+$ mem search "dragon"
+No match for "dragon".
+
+Searched for:
+  dragon
+
+19 indexed files have no readable text, so they are findable only by filename.
+Searching for what an image shows is outside what text search can do.
+
+51 files are indexed. Try fewer or more general words.
+```
+
+This is the failure that cost real debugging time. A folder of photographs is
+indexed, `mem` is asked for "dragon", and it correctly returns nothing —
+because none of those files contain the word. Without this line the only advice
+offered was "try fewer or more general words", which cannot possibly work: the
+files hold no words at all. A correct answer that explains nothing is still a
+dead end.
+
+The note is **suppressed when every indexed file has text**, so an ordinary
+miss stays a one-line answer instead of picking up a paragraph that does not
+apply. Both extra queries run only after a miss, so a successful search pays
+nothing for them.
 
 ### Stage 3: explain each result
 
@@ -906,10 +992,19 @@ demo's best result.
   servers. The boundary: the moment content becomes *local* — screenshot, chat
   forward, save — it is indexable. Going further would mean reading your
   account, which this tool deliberately does not do.
-- **OCR reads printed text, not handwriting.** Measured: 1 of 13 images.
+- **OCR reads printed text, not handwriting.** Measured: 1 of 5 images in a
+  screenshots folder.
 - **Scanned PDFs aren't OCR'd.** They have no text layer, and rasterising a page
   needs `pdftoppm`. Images are covered; scanned PDFs are not.
-- **Photos with no words yield nothing.** EXIF is not read.
+- **Photos with no words yield nothing, and `mem` cannot tell you what a picture
+  depicts.** This is the hard boundary. `mem` finds *words inside files*,
+  including words inside images — it does not recognise subjects. Searching a
+  folder of photographs for "dragon" returns nothing, correctly, because
+  nothing there is written in English. The tool names this rather than
+  suggesting you reword the query.
+- **A stat failure other than "not found" preserves a stale row.** If a mounted
+  drive disappears mid-scan, `mem` will not delete its rows, because it cannot
+  prove the files are gone. Re-scan once the drive is back.
 Every bound in the program, with its value:
 
 | Constant | Value | Where |
@@ -934,9 +1029,10 @@ Every bound in the program, with its value:
 - **The index is shared across folders**, keyed by absolute path. Use `--db` to
   separate projects.
 - **`sha256` is stored but unused** for deduplication.
-- **No file deletion ever.** Deleting a file leaves its row in the index until
-  you delete the database or re-scan a tree without it. `Forget` exists but
-  nothing currently calls it — a real gap, not an oversight I'd defend.
+- **No file deletion ever.** `mem` never touches your files, only its own index.
+  It does remove *rows* for files you deleted, and reports every one.
+- **You must re-scan a folder for its deletions to be noticed.** The index is
+  not watched; nothing runs in the background.
 
 ---
 
@@ -1034,7 +1130,34 @@ time mem scan ~/Downloads      # second: ~4ms, "Skipped 46 unchanged files"
 **The OCR claim, on your own files**
 
 ```bash
-mem scan ~/Downloads --force   # "OCR'd 13 images: 1 readable, 1 no text, 11 unreadable noise"
+mem scan ~/Pictures/Screenshots --force
+# "OCR'd 5 images: 1 readable, 2 with no text, 2 unreadable noise"
+```
+
+**Deleted files are pruned, and the FTS entry goes too**
+
+```bash
+D=$(mktemp -d); printf 'operating system scheduling\n' > $D/b.txt
+mem --db /tmp/t.db scan $D          # Indexed 1 files
+rm $D/b.txt
+mem --db /tmp/t.db scan $D          # Removed 1 file(s) that are no longer on disk
+mem --db /tmp/t.db search "operating system scheduling"   # No match
+sqlite3 /tmp/t.db "SELECT COUNT(*) FROM files; SELECT COUNT(*) FROM files_fts;"  # 0  0
+```
+
+**Scanning one folder never touches another**
+
+```bash
+mem --db /tmp/t.db scan ~/Downloads        # 47 rows
+mem --db /tmp/t.db scan ~/Pictures         # 52 rows, Downloads untouched
+sqlite3 /tmp/t.db "SELECT COUNT(*) FROM files WHERE path LIKE '/home/kaiser/Downloads%';"
+```
+
+**The text-free population, which is what a "dragon" search runs into**
+
+```bash
+sqlite3 $DB "SELECT COUNT(*) FROM files WHERE content IS NULL OR TRIM(content)='';"  # 19
+mem search "dragon"    # names the 19, and says so
 ```
 
 **Nothing destructive, verified**
@@ -1050,15 +1173,15 @@ ls ~/Downloads | wc -l                 # unchanged after every command
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `main.go` | ~330 | CLI dispatch, `scan`, `stats`, `related`, flag parsing, formatting helpers |
-| `help.go` | ~250 | Overview and per-command help text |
-| `db.go` | ~320 | Schema, FTS5, triggers, `Upsert`, `Lookup`, `related`, `distinctiveTerms` |
+| `main.go` | ~366 | CLI dispatch, `scan`, `stats`, `related`, flag parsing, formatting helpers |
+| `help.go` | ~270 | Overview and per-command help text |
+| `db.go` | ~429 | Schema, FTS5, triggers, `Upsert`, `Lookup`, `PruneMissing`, `related`, `distinctiveTerms` |
 | `scanner.go` | ~133 | `filepath.WalkDir`, skip rules, limits, `ScanStats` |
-| `extractor.go` | ~636 | PDF/DOCX/PPTX/text/OCR extraction, **OCR quality gate**, categorisation |
-| `search.go` | ~759 | Query parser, FTS5 query, bm25 ranking, confidence, output |
+| `extractor.go` | ~668 | PDF/DOCX/PPTX/text/OCR extraction, **OCR quality gate**, categorisation |
+| `search.go` | ~786 | Query parser, FTS5 query, bm25 ranking, confidence, output |
 | `organizer.go` | ~187 | Categorisation, preview, safe copy |
 | `timeutil.go` | ~83 | Relative time rendering |
-| `mem_test.go` | ~713 | 42 tests: parser, ranking, OCR gate, help, safety |
+| `mem_test.go` | ~993 | 54 tests: parser, ranking, OCR gate, pruning, help, safety |
 
 ```bash
 go test ./...                              # whole suite

@@ -207,16 +207,17 @@ noise is consonant fragments. Measured on the sample corpus:
 | Handwriting noise | 0.067 – 0.091 | rejected |
 
 That is a 4x gap with the threshold at 0.18, so the gate is not balanced on a
-knife edge. Scan reports the split honestly:
+knife edge. Scan reports all four outcomes separately, because "there was
+nothing to read" and "the reading was garbage" need opposite responses:
 
 ```
-OCR'd 13 images: 1 readable, 1 no text, 11 unreadable noise
+OCR'd 5 images: 1 readable, 2 with no text, 2 unreadable noise
 ```
 
 Which is the honest result: OCR reliably reads **printed** text — screenshots,
-chat images, photographed slides — and does **not** read handwriting. Handwriting
-OCR is a genuinely hard problem, and pretending otherwise would be worse than
-saying so.
+chat images, photographed slides — and does **not** read handwriting, and
+cannot tell you what a picture depicts. Handwriting OCR is a genuinely hard
+problem, and pretending otherwise would be worse than saying so.
 
 ```console
 $ mem search "unit of resistance and electric current"
@@ -240,13 +241,22 @@ Honest about what this does not do:
   a chat forward, a save — it is indexable. Reaching past that would mean
   reading your account, which this tool deliberately does not do.
 - **OCR reads printed text, not handwriting.** See the quality-gate section
-  above. On the sample corpus, 1 of 13 images was readable; the rest were
-  handwriting and correctly rejected rather than indexed as noise.
+  above. On a screenshots folder, 1 of 5 images was readable; the rest were
+  wordless photographs, contact lists and handwriting, each reported as its own
+  outcome rather than lumped in as noise.
 - **Scanned PDFs are still not OCR'd.** A PDF that is a photograph of pages has
   no text layer, and rasterising a PDF page would need a renderer such as
   `pdftoppm`. Images are covered; scanned PDFs are not.
-- **Photos with no text yield nothing.** A landscape has no words to read, so it
-  stays filename-only. EXIF metadata is not read yet.
+- **Photos with no words yield nothing, and `mem` cannot tell you what a picture
+  depicts.** This is the hard boundary. `mem` finds *words inside files*,
+  including words inside images; it does not recognise subjects. Searching a
+  folder of photographs for "dragon" returns nothing — correctly, since nothing
+  there is written in English. Rather than suggest you reword the query, `mem`
+  tells you how many indexed files have no readable text, so the boundary is
+  visible instead of mysterious.
+- **Deleted files are cleaned up on the next scan of their folder,** and each
+  removal is reported. The index is not watched, so a deletion is not noticed
+  until you re-scan.
 - **Files over 64 MB are skipped** for speed. A 72MB scanned textbook tells us
   nothing a filename does not.
 - **Only the first 40 pages of a PDF are read,** and at most 200KB of text is

@@ -83,17 +83,22 @@ Scanning ~/Downloads...
 
 Indexed 46 files
 Extracted text from 31 files
-OCR'd 13 images: 1 readable, 1 no text, 11 unreadable noise
+OCR'd 13 images: 1 readable, 5 with no text, 7 unreadable noise
 Skipped 0 unchanged files
+Skipped 1 files over 64 MB
 
-Memory index updated. 46 files known in total.
+Memory index updated. 51 files known in total.
 Index file: /home/you/.mem/index.db
 ```
 
 **Read the OCR line carefully.** 13 images were attempted. Only 1 produced
-usable text; 11 produced garbage that was thrown away. The tool is telling you
-its real coverage instead of claiming it read everything. You will come back
-to this in Step 6.
+usable text. 5 more had no words in them at all — a photograph of an object, a
+screenshot of an icon — and no OCR engine on earth would find text in those.
+The other 7 produced text that was not prose: handwriting, contact lists,
+screen furniture. The tool is telling you its real coverage instead of claiming
+it read everything, and it keeps "nothing was there" separate from "the reading
+failed" because those need opposite responses. You will come back to this in
+Step 6.
 
 Run it again:
 
@@ -300,11 +305,32 @@ consonant fragments. Measured on a real sample:
 | Handwriting noise | 0.067 – 0.091 | rejected |
 
 A 4× gap, with the threshold at 0.18, so the gate is not balanced on a knife
-edge. That is why `scan` reported `1 readable, 11 unreadable noise` in Step 1.
+edge. That is why `scan` reported `7 unreadable noise` in Step 1.
 
 **The honest conclusion:** OCR reliably reads *printed* text — screenshots,
-chat forwards, photographed slides. It does **not** read handwriting. Handwriting
-recognition is a genuinely hard problem, and saying so beats pretending.
+chat forwards, photographed slides. It does **not** read handwriting, and it
+cannot tell you what a picture depicts. Handwriting recognition is a genuinely
+hard problem, and saying so beats pretending.
+
+**If someone asks "can it find my photo of a dragon?"** — the honest answer is
+no, and the reason is worth stating plainly: `mem` finds *words inside files*,
+including words inside images. It does not recognise subjects. A photograph of a
+dragon contains no words, so there is nothing for any text search to match.
+`mem` says so rather than telling you to reword the query:
+
+```console
+$ mem search "dragon"
+No match for "dragon".
+
+Searched for:
+  dragon
+
+19 indexed files have no readable text, so they are findable only by filename.
+Searching for what an image shows is outside what text search can do.
+```
+
+The same is true of a screenshot whose words OCR could not read: it is indexed,
+it is findable by filename and by date, and it will never match a content query.
 
 ---
 
@@ -492,8 +518,13 @@ Read this section before you point it at anything you care about.
 - **Scanned PDFs are not OCR'd.** A PDF that is a photograph of pages has no
   text layer. Rasterising a page would need a renderer such as `pdftoppm`.
   Images are covered; scanned PDFs are not.
-- **Photos with no words yield nothing.** A landscape has no text to read, so
-  it stays filename-only. EXIF metadata is not read.
+- **It cannot tell you what a picture shows.** It finds words inside files,
+  words inside images included. It does not recognise subjects, so a photo of a
+  dragon is not findable by asking for "dragon" — there are no words in it to
+  match. `mem` names this boundary instead of sending you off to reword the
+  query.
+- **Deleted files are noticed on the next scan,** and each removal is reported.
+  The index is not watched, so nothing happens until you re-scan.
 - **Files over 64 MB are skipped** for speed.
 - **Only the first 40 pages of a PDF are read,** and at most 200KB of text is
   stored per file. Enough to characterise a document, not to archive it.
