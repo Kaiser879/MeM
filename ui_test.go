@@ -318,6 +318,32 @@ func TestUITruncatePlainIsRuneSafe(t *testing.T) {
 	}
 }
 
+func TestUIRenderSnippetCollapsesMarkerSpaces(t *testing.T) {
+	// Zero-value styles render text unchanged, so the assertions read plainly.
+	m := &uiModel{}
+
+	cases := map[string]string{
+		"Linux >> process << scheduling": "Linux process scheduling",
+		"a >> b << >> c << d":            "a b c d",
+		"no markers at all":              "no markers at all",
+	}
+	for in, want := range cases {
+		if got := m.renderSnippet(in, 80); got != want {
+			t.Errorf("renderSnippet(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// A marker at the very edge of the snippet must not leave a stray space.
+	if got := m.renderSnippet(">> leading << text", 80); got != " leading text" {
+		t.Errorf("edge marker left %q", got)
+	}
+
+	// The budget still counts the ellipsis as one of the characters.
+	if got := m.renderSnippet("abcdefghij", 5); got != "abcd…" {
+		t.Fatalf("truncation = %q, want %q", got, "abcd…")
+	}
+}
+
 func TestUIPlainFallbackUsesASCII(t *testing.T) {
 	st := newUIStyles(true, true)
 	if st.gBullet != "*" || st.gGutter != "|_" || st.gMarker != ">" || st.gBar != "#" {

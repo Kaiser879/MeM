@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"image/color"
 	"strings"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
@@ -454,52 +455,67 @@ func (m *uiModel) resultBlock(i int, r result) []string {
 
 // renderSnippet turns the FTS5 highlight markers into styled spans, truncating
 // at the visible-width budget so a long fragment cannot wrap the layout.
+//
+// The markers the query writes are " >> " and " << ", spaces included. Removing
+// only the marker characters therefore leaves runs of spaces at every highlight
+// boundary, which reads as broken word spacing on screen. cleanSnippet has
+// already collapsed real whitespace, so every repeated space left here came
+// from a marker and can safely be collapsed to one.
 func (m *uiModel) renderSnippet(s string, max int) string {
 	s = strings.NewReplacer("\n", " ", "\r", " ").Replace(s)
 	if max <= 0 {
 		return ""
 	}
-	budget := max - 1 // room for the ellipsis
-	var b strings.Builder
-	hl := false
-	vis := 0
-	truncated := false
 
+	var text []rune
+	var hit []bool
+	highlighted := false
 	for i := 0; i < len(s); {
 		switch {
 		case strings.HasPrefix(s[i:], ">>"):
-			hl = true
+			highlighted = true
 			i += 2
 			continue
 		case strings.HasPrefix(s[i:], "<<"):
-			hl = false
+			highlighted = false
 			i += 2
 			continue
 		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		text = append(text, r)
+		hit = append(hit, highlighted)
+		i += size
+	}
+
+	for i := 1; i < len(text); i++ {
+		if text[i] == ' ' && text[i-1] == ' ' {
+			text = append(text[:i], text[i+1:]...)
+			hit = append(hit[:i], hit[i+1:]...)
+			i--
+		}
+	}
+
+	// One character of the budget is spent on the ellipsis, as before.
+	budget := max - 1
+	truncated := len(text) > budget
+	if truncated {
+		text = text[:budget]
+		hit = hit[:budget]
+	}
+
+	var b strings.Builder
+	for i := 0; i < len(text); {
 		j := i
-		for j < len(s) && !strings.HasPrefix(s[j:], ">>") && !strings.HasPrefix(s[j:], "<<") {
+		for j < len(text) && hit[j] == hit[i] {
 			j++
 		}
-		chunk := []rune(s[i:j])
-		room := budget - vis
-		if room <= 0 {
-			truncated = true
-			break
-		}
-		if len(chunk) > room {
-			chunk = chunk[:room]
-			truncated = true
-		}
-		if hl {
-			b.WriteString(m.styles.highlight.Render(string(chunk)))
+		chunk := string(text[i:j])
+		if hit[i] {
+			b.WriteString(m.styles.highlight.Render(chunk))
 		} else {
-			b.WriteString(m.styles.snippetText.Render(string(chunk)))
+			b.WriteString(m.styles.snippetText.Render(chunk))
 		}
-		vis += len(chunk)
 		i = j
-		if truncated {
-			break
-		}
 	}
 	if truncated {
 		b.WriteString(m.styles.faint.Render("…"))
