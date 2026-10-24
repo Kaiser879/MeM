@@ -20,6 +20,7 @@ Every number in here was measured on a real 46-file index, and every claim has a
 - [`mem organize`](#mem-organize--what-happens-when-you-tidy)
 - [`mem related`](#mem-related--what-happens-when-you-follow-a-thread)
 - [`mem stats`](#mem-stats--what-happens-when-you-ask-whats-indexed)
+- [`mem ui`](#mem-ui--the-terminal-interface)
 - [`mem help`](#mem-help--what-happens-when-you-ask-for-help)
 - [Flags](#flags)
 - [Exit codes](#exit-codes)
@@ -872,6 +873,40 @@ explains it.
 
 ---
 
+## `mem ui` — the terminal interface
+
+```bash
+mem ui
+```
+
+`mem ui` is a Bubble Tea program that owns no search logic of its own. Every
+screen calls the same `Store` methods the CLI calls — `Search`, `Related`,
+`Stats`, `Content`, `ScanAndIndex`, `OrganizePlan` — and renders the values
+they return with Lip Gloss. Nothing about ranking, parsing, extraction or
+categorisation is reimplemented, so a result in the TUI is the same result
+`mem search` would print.
+
+The seam that makes this possible is deliberate: the core returns *data*
+(`result`, `parsedQuery`, `StatsData`, `ScanReport`, `organizePreview`), and
+both front ends format it. The CLI's `cmdSearch`, `cmdStats` and friends are
+thin printers over those values.
+
+Two things are worth knowing about the plumbing:
+
+- **A scan runs in its own `Store` handle.** `ScanAndIndex` streams progress
+  through a callback; the UI turns each callback into a message and redraws.
+  Because the scan writes on a separate connection, the reads backing search
+  keep working. WAL gives one writer plus many readers.
+- **`ScanAndIndex` and `OrganizePlan` are the same functions the CLI uses.**
+  The safety model is unchanged: a scan reads files and writes only the index,
+  and organize returns a description that is copied to disk only when the user
+  presses `a` — and `applyPlan` still refuses to overwrite.
+
+Every screen is pinned by a test that renders it and, for search, checks the
+honest-miss text appears. A missing cursor or a panic in a view fails CI.
+
+---
+
 ## `mem help` — what happens when you ask for help
 
 ```bash
@@ -1173,15 +1208,18 @@ ls ~/Downloads | wc -l                 # unchanged after every command
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `main.go` | ~366 | CLI dispatch, `scan`, `stats`, `related`, flag parsing, formatting helpers |
-| `help.go` | ~270 | Overview and per-command help text |
-| `db.go` | ~429 | Schema, FTS5, triggers, `Upsert`, `Lookup`, `PruneMissing`, `related`, `distinctiveTerms` |
-| `scanner.go` | ~133 | `filepath.WalkDir`, skip rules, limits, `ScanStats` |
-| `extractor.go` | ~668 | PDF/DOCX/PPTX/text/OCR extraction, **OCR quality gate**, categorisation |
+| `main.go` | ~300 | CLI dispatch, `scan`, `stats`, `related`, flag parsing, formatting helpers |
+| `help.go` | ~294 | Overview and per-command help text |
+| `db.go` | ~519 | Schema, FTS5, triggers, `Upsert`, `Lookup`, `PruneMissing`, `related`, `distinctiveTerms` |
+| `scanner.go` | ~250 | `filepath.WalkDir`, skip rules, limits, `ScanStats` |
+| `extractor.go` | ~792 | PDF/DOCX/PPTX/text/OCR extraction, **OCR quality gate**, categorisation |
 | `search.go` | ~786 | Query parser, FTS5 query, bm25 ranking, confidence, output |
-| `organizer.go` | ~187 | Categorisation, preview, safe copy |
+| `organizer.go` | ~227 | Categorisation, preview, safe copy |
 | `timeutil.go` | ~83 | Relative time rendering |
-| `mem_test.go` | ~993 | 54 tests: parser, ranking, OCR gate, pruning, help, safety |
+| `ui.go` | ~930 | `mem ui`: Bubble Tea model, update loop, messages, commands |
+| `ui_views.go` | ~940 | `mem ui`: Lip Gloss palette, glyphs, and per-screen rendering |
+| `mem_test.go` | ~1263 | 50 tests: parser, ranking, OCR gate, pruning, help, safety |
+| `ui_test.go` | ~381 | TUI tests: search flow, honest miss, key routing, per-screen render, theme |
 
 ```bash
 go test ./...                              # whole suite

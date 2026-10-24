@@ -43,6 +43,7 @@ go build -o mem .
 ```bash
 mem scan ~/Downloads                  # index a folder
 mem search "your memory here"         # find it again
+mem ui                                # or browse it in a terminal interface
 mem organize ~/Downloads              # preview a tidy-up plan
 mem related "1st Year Syllabus.pdf"   # find related memories
 mem stats                             # what is indexed
@@ -64,6 +65,7 @@ that prove each claim live.
 | `scan <dir>` | Walks the tree, extracts text, indexes everything. Re-scans skip unchanged files; `--force` re-reads. |
 | — | OCR reads text out of images when `tesseract` is installed. |
 | `search "<query>"` | Natural-language search. `--limit N`, `--type pdf`. Alias: `find`. |
+| `ui` | Browse and search the index in a terminal interface (Bubble Tea). `--limit N`, `--type pdf`. |
 | `organize <dir>` | **Preview only by default.** `--apply` to copy into folders. Alias: `organise`. |
 | `related <file>` | Memories sharing distinctive vocabulary with a file. |
 | `stats` | Counts and categories of what is currently indexed. |
@@ -85,6 +87,36 @@ The tool is deliberately incapable of destroying your data:
 - `organize --apply` **copies**. It never moves, never deletes, never overwrites
   (it adds a `-2`, `-3` suffix on collision). It asks for confirmation first.
 - Nothing is ever sent to a network service. There is no AI API call.
+
+---
+
+## Terminal interface
+
+`mem ui` opens the index in a full-screen terminal interface built with
+[Bubble Tea](https://github.com/charmbracelet/bubbletea). It is the same index
+and the same search the CLI uses, with navigation on top.
+
+```console
+$ mem ui
+```
+
+- **Search** — type a description; results update as you type. The quiet `⌕`
+  line above the input echoes how the words were parsed, and an empty result
+  explains itself exactly as the CLI does.
+- **Detail** — open a result to read its stored text, open the file with your
+  desktop handler (`o`), copy its path (`c`), or jump to related files (`r`).
+- **Scan** (`i`) — index a folder with a live progress bar and the same honest
+  coverage report.
+- **Organize** (`o`) — preview a tidy-up plan; `a` copies, and only after a
+  second confirmation. Nothing is ever moved, deleted or overwritten.
+- **Stats** (`s`) — totals and the category/type breakdown.
+
+The interface only ever reads. A search and a scan write nothing, and organize
+stays a preview until you press `a`. It runs in the alternate screen and
+restores your terminal on exit. The look is deliberately flat — one warm accent
+on plain text, with structure carried by an indented gutter — and it adapts to
+light and dark terminals. With `NO_COLOR` set, or on a `TERM=dumb` terminal, it
+falls back to plain ASCII with no colour.
 
 ---
 
@@ -279,13 +311,16 @@ Honest about what this does not do:
 mem/
 ├── main.go        CLI dispatch, scan, stats, related
 ├── help.go        overview and per-command help
-├── db.go          schema, upserts, incremental logic, related
-├── scanner.go     recursive directory walk
+├── db.go          schema, upserts, incremental logic, related, stats
+├── scanner.go     recursive directory walk and the scan driver
 ├── extractor.go   text/PDF/DOCX/PPTX/OCR → plain text, categorisation
 ├── search.go      query parser, FTS5 ranking, output
 ├── organizer.go   preview → confirm → copy
 ├── timeutil.go    relative time formatting
+├── ui.go          `mem ui`: Bubble Tea model, update loop, commands
+├── ui_views.go    `mem ui`: Lip Gloss rendering for each screen
 ├── mem_test.go    parser, ranking, OCR-gate, help, and safety tests
+├── ui_test.go     TUI model, key routing, and per-screen render tests
 ├── demo.sh        three-beat demo script
 ├── README.md      this file — design rationale and limitations
 ├── TUTORIAL.md    hands-on walkthrough, start here
@@ -299,7 +334,9 @@ go test ./...    # test suite
 ```
 
 Dependencies: `modernc.org/sqlite` (pure-Go SQLite, no cgo),
-`github.com/ledongthuc/pdf` (PDF fallback extractor).
+`github.com/ledongthuc/pdf` (PDF fallback extractor), and for `mem ui` the
+Charm stack: `charm.land/bubbletea/v2`, `charm.land/bubbles/v2`, and
+`charm.land/lipgloss/v2`.
 
 Optional system tools, each detected at runtime and degrading gracefully when
 absent: `pdftotext` (higher-quality PDF text) and `tesseract` (OCR for images).

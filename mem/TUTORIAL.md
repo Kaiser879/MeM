@@ -441,7 +441,29 @@ files but you expected text in all of them, remember the OCR line from Step 1:
 
 ---
 
-## Step 8 — The demo script
+## Step 8 — Browse it in a terminal interface
+
+Everything above works from the command line. If you would rather move around,
+`mem ui` opens the same index in a full-screen terminal interface:
+
+```bash
+mem ui
+```
+
+Type to search (results update as you type), press `enter` to open a result and
+read its stored text, `r` to follow a thread to related files, `i` to scan a
+new folder with a live progress bar, and `o` to preview an organize plan. Press
+`?` inside for the full key list, `ctrl+c` to quit.
+
+It is the same engine and the same safety model: search and scan only read,
+and organize stays a preview until you press `a`. The interface runs in the
+alternate screen and restores your terminal on exit. The look is flat and
+warm — one coral accent on plain text — and follows your terminal's light or
+dark background, falling back to plain ASCII when colour is off.
+
+---
+
+## Step 9 — The demo script
 
 ```bash
 ./demo.sh
@@ -463,6 +485,7 @@ takes an optional directory:
 |---|---|
 | `scan <dir>` | Index a folder. `--force` re-reads everything. |
 | `search <query>` | Find by description. `--limit N`, `--type ext`. Alias: `find`. |
+| `ui` | Browse and search the index in a terminal interface. `--limit N`, `--type ext`. |
 | `organize <dir>` | Preview a tidy-up plan. `--apply` copies, `--yes` skips the prompt, `--into <dir>` redirects. Alias: `organise`. |
 | `related <file>` | Find documents with overlapping vocabulary. |
 | `stats` | Counts by category and file type. |

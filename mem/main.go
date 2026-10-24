@@ -71,6 +71,8 @@ func run(args []string) error {
 		return cmdRelated(rest, dbPath)
 	case "stats":
 		return cmdStats(dbPath)
+	case "ui":
+		return cmdUI(rest, dbPath)
 	default:
 		// Print the overview before the error: someone who mistyped a
 		// command needs to see what the commands are.
@@ -115,105 +117,43 @@ func cmdScan(args []string, dbPath string) error {
 
 	fmt.Printf("Scanning %s...\n\n", prettyPath(dir))
 
-	files, stats, err := Scan(dir)
+	rep, err := store.ScanAndIndex(dir, force, nil)
 	if err != nil {
 		return err
 	}
 
-	var indexed, extracted, unchanged int
-	resetOCRStats()
-
-	// Every path the walk produced, including the ones we are about to skip as
-	// unchanged. PruneMissing compares against this set to spot rows whose
-	// files have since been deleted.
-	seen := make(map[string]bool, len(files))
-	for _, fi := range files {
-		seen[fi.Path] = true
-	}
-
-	for _, fi := range files {
-		// Skip work entirely when size and mtime match what we stored. This
-		// is what makes a second scan feel instant.
-		if !force {
-			if prev, found, err := store.Lookup(fi.Path); err == nil && found {
-				if prev.Size == fi.Size && prev.Modified == fi.ModifiedAt {
-					unchanged++
-					continue
-				}
-			}
-		}
-
-		text, kind, xerr := Extract(fi.Path, fi.Ext)
-		if xerr != nil {
-			// Extraction problems are never fatal: the file still gets indexed
-			// by name, size and timestamp, so it stays findable. A scanned PDF
-			// or a corrupted file simply has no text to search.
-			text, kind = "", "meta"
-		}
-		if strings.TrimSpace(text) == "" {
-			// Extracted nothing usable: record it as metadata-only.
-			text, kind = "", "meta"
-		}
-		if kind != "meta" {
-			extracted++
-		}
-
-		cat := categoryFor(fi.Ext, fi.Filename)
-		if err := store.Upsert(fi, text, kind, cat, hashFile(fi.Path)); err != nil {
-			return fmt.Errorf("index %s: %w", fi.Path, err)
-		}
-		indexed++
-	}
-
-	// Drop rows for files that have been deleted since the last scan. Scoped to
-	// the folder just walked, and only reached because Scan returned without
-	// error — a walk that could not read the tree tells us nothing about what is
-	// missing from it, so pruning on a partial walk would delete live rows.
-	absRoot, err := filepath.Abs(dir)
-	if err != nil {
-		return err
-	}
-	pruned, err := store.PruneMissing(absRoot, seen)
-	if err != nil {
-		return fmt.Errorf("prune missing files: %w", err)
-	}
-
-	fmt.Printf("Indexed %d files\n", indexed)
-	fmt.Printf("Extracted text from %d files\n", extracted)
-	if ocrCounts.used > 0 {
+	fmt.Printf("Indexed %d files\n", rep.Indexed)
+	fmt.Printf("Extracted text from %d files\n", rep.Extracted)
+	if rep.OCR.used > 0 {
 		// Report OCR coverage precisely, and keep "found no words" separate
 		// from "found words that were not prose". They are different problems
-		// with opposite responses: an image with no words in it will never be
-		// found by searching for what it depicts, however many times it is
-		// re-scanned, and reporting it as unreadable noise invites a threshold
-		// change that cannot help.
+		// with opposite responses.
 		fmt.Printf("OCR'd %d images: %d readable, %d with no text, %d unreadable noise\n",
-			ocrCounts.used, ocrCounts.readable, ocrCounts.nothing, ocrCounts.noise)
+			rep.OCR.used, rep.OCR.readable, rep.OCR.nothing, rep.OCR.noise)
 	}
 	if !ocrEnabled() {
 		fmt.Println("OCR not installed: images are indexed by name only")
 	}
-	fmt.Printf("Skipped %d unchanged files\n", unchanged)
-	if len(pruned) > 0 {
+	fmt.Printf("Skipped %d unchanged files\n", rep.Unchanged)
+	if len(rep.Pruned) > 0 {
 		// Removal is reported, never silent. Silently dropping index rows would
 		// make search results change with no explanation for it.
-		fmt.Printf("Removed %d file(s) that are no longer on disk\n", len(pruned))
-		for i, p := range pruned {
+		fmt.Printf("Removed %d file(s) that are no longer on disk\n", len(rep.Pruned))
+		for i, p := range rep.Pruned {
 			if i == 3 {
-				fmt.Printf("  ... and %d more\n", len(pruned)-3)
+				fmt.Printf("  ... and %d more\n", len(rep.Pruned)-3)
 				break
 			}
 			fmt.Printf("  %s\n", prettyPath(p))
 		}
 	}
-	if stats.SkippedLarge > 0 {
-		fmt.Printf("Skipped %d files over %d MB\n", stats.SkippedLarge, maxIndexableSize>>20)
+	if rep.SkippedLarge > 0 {
+		fmt.Printf("Skipped %d files over %d MB\n", rep.SkippedLarge, maxIndexableSize>>20)
 	}
-	if stats.SkippedMeta > 0 {
-		fmt.Printf("Skipped %d hidden or non-regular files\n", stats.SkippedMeta)
+	if rep.SkippedMeta > 0 {
+		fmt.Printf("Skipped %d hidden or non-regular files\n", rep.SkippedMeta)
 	}
-	total, _ := store.Count()
-	fmt.Printf("\nMemory index updated. %d files known in total.\n", total)
+	fmt.Printf("\nMemory index updated. %d files known in total.\n", rep.Total)
 	fmt.Printf("Index file: %s\n", store.Path())
 	return nil
 }
@@ -226,56 +166,28 @@ func cmdStats(dbPath string) error {
 	}
 	defer store.Close()
 
-	total, err := store.Count()
+	st, err := store.Stats()
 	if err != nil {
 		return err
 	}
-	if total == 0 {
+	if st.Total == 0 {
 		fmt.Println("The index is empty. Try:  mem scan ~/Downloads")
 		return nil
 	}
 
-	var bytes int64
-	_ = store.db.QueryRow(`SELECT COALESCE(SUM(size),0) FROM files`).Scan(&bytes)
-
-	fmt.Printf("Memories indexed: %d\n", total)
-	fmt.Printf("Total size:       %s\n", humanBytes(uint64(bytes)))
-	fmt.Printf("Index file:       %s\n\n", store.Path())
+	fmt.Printf("Memories indexed: %d\n", st.Total)
+	fmt.Printf("Total size:       %s\n", humanBytes(uint64(st.TotalBytes)))
+	fmt.Printf("Index file:       %s\n\n", st.Path)
 
 	fmt.Println("By category:")
-	catRows, err := store.db.Query(`SELECT category, COUNT(*), SUM(size)
-	                                 FROM files GROUP BY category ORDER BY 2 DESC`)
-	if err != nil {
-		return err
+	for _, c := range st.Categories {
+		fmt.Printf("  %-14s %4d  %s\n", c.Name, c.Count, humanBytes(uint64(c.Bytes)))
 	}
-	for catRows.Next() {
-		var cat string
-		var n int
-		var sz int64
-		catRows.Scan(&cat, &n, &sz)
-		if cat == "" {
-			cat = "Uncategorised"
-		}
-		fmt.Printf("  %-14s %4d  %s\n", cat, n, humanBytes(uint64(sz)))
-	}
-	catRows.Close()
 
 	fmt.Println("\nBy file type:")
-	extRows, err := store.db.Query(`SELECT extension, COUNT(*)
-	                                 FROM files GROUP BY extension ORDER BY 2 DESC LIMIT 12`)
-	if err != nil {
-		return err
+	for _, e := range st.Extensions {
+		fmt.Printf("  %-14s %4d\n", e.Ext, e.Count)
 	}
-	for extRows.Next() {
-		var ext string
-		var n int
-		extRows.Scan(&ext, &n)
-		if ext == "" {
-			ext = "(none)"
-		}
-		fmt.Printf("  %-14s %4d\n", ext, n)
-	}
-	extRows.Close()
 	return nil
 }
 
@@ -290,7 +202,29 @@ func cmdRelated(args []string, dbPath string) error {
 		return err
 	}
 	defer store.Close()
-	return store.related(args[0])
+
+	data, err := store.Related(args[0])
+	if err != nil {
+		return err
+	}
+
+	target := data.Target
+	fmt.Printf("Memories related to %s\n\n", target.Filename)
+	fmt.Printf("  %s\n  category: %s · %s\n\n", prettyPath(target.Path),
+		target.Category, humanBytes(uint64(target.Size)))
+
+	if len(data.Terms) == 0 {
+		fmt.Println("  (this file has no extracted text to compare on)")
+		return nil
+	}
+	for _, r := range data.Hits {
+		fmt.Printf("  %-44s %s · %s\n", truncate(r.Filename, 44),
+			humanBytes(uint64(r.Size)), timeAgo(r.Modified))
+	}
+	if len(data.Hits) == 0 {
+		fmt.Println("  (nothing else in the index shares vocabulary with this file)")
+	}
+	return nil
 }
 
 // cmdOrganize is defined in organizer.go.

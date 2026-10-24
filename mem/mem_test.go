@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -814,7 +815,7 @@ func captureStdout(t *testing.T, fn func()) string {
 // rotting. A command with no help entry would print the whole overview and
 // exit 1, which is exactly what a confused user experiences as "broken".
 func TestHelpIsAvailableForEveryCommand(t *testing.T) {
-	commands := []string{"scan", "search", "organize", "related", "stats", "help", "version"}
+	commands := []string{"scan", "search", "ui", "organize", "related", "stats", "help", "version"}
 	for _, c := range commands {
 		text, ok := helpFor(c)
 		if !ok {
@@ -990,4 +991,273 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// Source-code indexing.
+//
+// Before this, organize filed 17 source extensions under "Programming" while
+// the extractor read none of them, so every one of them was findable by
+// filename and invisible by content. These tests pin the fixed behaviour, and
+// in particular the boundary case that a naive "long line means generated"
+// rule gets wrong.
+
+func TestEveryCodeExtensionIsAlsoReadable(t *testing.T) {
+	for ext := range codeExtensions {
+		if !textExtensions[ext] {
+			t.Errorf("%s is categorized as source code but the extractor cannot read it", ext)
+		}
+		if got := categorizeFor(ext, "main"+ext); got != "Programming" {
+			t.Errorf("organize files %s under %q, want %q", ext, got, "Programming")
+		}
+	}
+}
+
+func TestEveryConfigExtensionIsReadable(t *testing.T) {
+	for ext := range configExtensions {
+		if !textExtensions[ext] {
+			t.Errorf("%s is listed as config but the extractor cannot read it", ext)
+		}
+	}
+}
+
+// TestSourceFileIsFoundByContent is the actual point of the change: a query
+// describing what the code *does* finds it, with no filename in the query.
+func TestSourceFileIsFoundByContent(t *testing.T) {
+	s := newTestStore(t)
+	dir := t.TempDir()
+
+	body := `package stats
+
+// MovingAverage smooths a series of samples using a sliding window.
+func MovingAverage(samples []float64, window int) []float64 {
+	var total float64
+	for i := 0; i < window; i++ {
+		total += samples[i]
+	}
+	return []float64{total / float64(window)}
+}
+`
+	indexTempFile(t, s, dir, "analysis.go", body)
+	// A decoy that shares vocabulary but not the phrase.
+	indexTempFile(t, s, dir, "readme.md", "This project computes statistics on sample data.")
+
+	hits, _, err := s.Search("sliding window average", 5, "")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("searching for 'sliding window average' found nothing, want analysis.go")
+	}
+	if !strings.Contains(hits[0].Filename, "analysis.go") {
+		t.Errorf("top hit was %q, want analysis.go", hits[0].Filename)
+	}
+}
+
+// Underscored names are the case a naive whitespace tokenizer misses.
+// unicode61 splits them, so no preprocessing of ours is needed.
+func TestUnderscoredIdentifierIsFindable(t *testing.T) {
+	s := newTestStore(t)
+	dir := t.TempDir()
+	indexTempFile(t, s, dir, "kernel.py", `
+def preemptive_round_robin(scheduler):
+    """Schedule the next task using a preemptive round robin policy."""
+    return scheduler.next_token
+`)
+
+	hits, _, err := s.Search("preemptive round robin", 5, "")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 || !strings.Contains(hits[0].Filename, "kernel.py") {
+		t.Fatalf("got %d hits, top %q, want kernel.py", len(hits), hits[0].Filename)
+	}
+}
+
+// textShape reports the two numbers looksGenerated actually keys on, so a
+// failing test says which side of the threshold its fixture landed on instead
+// of just asserting a bool.
+func textShape(s string) string {
+	longest, current, ws := 0, 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\n':
+			ws++
+			if current > longest {
+				longest = current
+			}
+			current = 0
+		case ' ', '\t', '\r':
+			ws++
+			current++
+		default:
+			current++
+		}
+	}
+	if current > longest {
+		longest = current
+	}
+	return "maxline=" + strconv.Itoa(longest) +
+		" ws/100B=" + strconv.FormatFloat(float64(ws)*100/float64(len(s)), 'f', 2, 64)
+}
+
+// minifiedLike reproduces the shape of a real build bundle.
+//
+// The unit below is lifted from the shape of msgpackr/dist/index.min.js, which
+// measured 2.79 whitespace bytes per 100 and a 30,252-char line. An earlier
+// version of this test used a unit with a space after every keyword, which
+// measured 8.70 — above the floor, so the guard correctly kept it, and the test
+// was asserting the opposite of what it claimed.
+func minifiedLike(size int) string {
+	const unit = "function e(t,n){return t&&n&&!e?Object.assign({},t):n}"
+	var sb strings.Builder
+	for sb.Len() < size {
+		sb.WriteString(unit)
+	}
+	return sb.String()
+}
+
+// formattedLike reproduces the shape of a hand-written source file that
+// happens to contain very long data rows — the golang.org/x/text
+// collate/tools/colcmp/chars.go case, which measured a 44,699-char line and
+// 28.95 ws/100B.
+//
+// The long rows are a small minority. That is the whole point: overall density
+// stays normal because ordinary code dominates the file.
+func formattedLike() string {
+	var sb strings.Builder
+	for i := 0; i < 900; i++ {
+		sb.WriteString("\tif err := validate(sample); err != nil {\n\t\treturn fmt.Errorf(\"bad value\", 0)\n\t}\n")
+	}
+	// One hand-maintained data row, far longer than any normal line.
+	sb.WriteString("\tvar table = \"" + strings.Repeat("x", 44699) + "\"\n")
+	return sb.String()
+}
+
+func TestLooksGeneratedRejectsMinifiedBundle(t *testing.T) {
+	bundle := minifiedLike(30000)
+	if !looksGenerated(bundle) {
+		t.Errorf("a real-shaped minified bundle should be rejected as generated (%s)", textShape(bundle))
+	}
+}
+
+// This is the case that rules out the simpler "long line means minified" rule.
+// chars.go is hand-written Go with a 44,699-char data line; rejecting it would
+// be indexing by guessing.
+func TestLooksGeneratedKeepsLongButFormattedFile(t *testing.T) {
+	formatted := formattedLike()
+	if looksGenerated(formatted) {
+		t.Errorf("hand-written source with long data rows must be kept (%s)", textShape(formatted))
+	}
+}
+
+// The guard is only as good as the constant in it. These two numbers were
+// chosen from a gap measured across 3,681 real text files, so pin the gap:
+// if either constant drifts out of the empty band between the two clusters,
+// the calibration no longer matches the evidence and needs re-measuring.
+func TestGeneratedThresholdsSitInTheMeasuredGap(t *testing.T) {
+	// Highest density any generated file showed, and lowest any legitimate
+	// long-line file showed, across the sampled corpus.
+	const highestGenerated = 3.79
+	const lowestLegitimate = 5.13
+
+	if float64(generatedWhitespace) <= highestGenerated {
+		t.Errorf("generatedWhitespace = %.2f is not above the highest generated density (%.2f); "+
+			"it would let real bundles into the index", generatedWhitespace, highestGenerated)
+	}
+	if float64(generatedWhitespace) >= lowestLegitimate {
+		t.Errorf("generatedWhitespace = %.2f is not below the lowest legitimate density (%.2f); "+
+			"it would throw away hand-written files", generatedWhitespace, lowestLegitimate)
+	}
+	// And the line threshold has to leave room above normal code, whose
+	// longest measured line was 137, while still catching a 30,252-char bundle.
+	if generatedMaxLine <= 137 {
+		t.Errorf("generatedMaxLine = %d is too close to the longest hand-written line (137)", generatedMaxLine)
+	}
+	if generatedMaxLine >= 30252 {
+		t.Errorf("generatedMaxLine = %d would not catch the 30,252-char bundle", generatedMaxLine)
+	}
+}
+
+func TestLooksGeneratedKeepsOrdinarySource(t *testing.T) {
+	body := strings.Repeat("func f(a int) int { return a + 1 }\n", 500)
+	if looksGenerated(body) {
+		t.Error("ordinary source code must never be treated as generated")
+	}
+}
+
+// A generated file is not lost. It is indexed by name, exactly like an image
+// with no readable text, so `mem search vendor` still resolves it.
+//
+// This goes through Extract on purpose. indexTempFile calls Upsert directly,
+// so a test built on it would never reach the guard and would pass whether or
+// not the guard exists.
+func TestGeneratedFileIsStoredWithoutTextButStaysFindableByName(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "vendor.bundle.js")
+
+	if err := os.WriteFile(p, []byte(minifiedLike(20000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	text, kind, err := Extract(p, ".js")
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if kind != "meta" || text != "" {
+		t.Fatalf("Extract returned kind=%q and %d chars, want \"meta\" and 0 for machine output", kind, len(text))
+	}
+
+	// And the row still exists, so a name search resolves it.
+	s := newTestStore(t)
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi := FileInfo{Path: p, Filename: "vendor.bundle.js", Ext: ".js",
+		Size: st.Size(), ModifiedAt: st.ModTime().Unix()}
+	if err := s.Upsert(fi, text, kind, documentCategory(fi.Filename), "sha"); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, _, err := s.Search("vendor", 5, "")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 || !strings.Contains(hits[0].Filename, "vendor.bundle.js") {
+		t.Fatalf("a generated file must stay findable by name; got %d hits", len(hits))
+	}
+}
+
+// The other half of the same guarantee: a normal source file really does come
+// back from Extract with its text intact, not just from a hand-built Upsert.
+func TestExtractReadsSourceCode(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"main.go", "package main\n\n// SpinLock guards a counter.\nfunc SpinLock() {}\n", "SpinLock"},
+		{"app.py", "def parse_tokens(text):\n    return text.split()\n", "parse_tokens"},
+		{"lib.rs", "pub fn next_token(&self) -> u8 { 0 }\n", "next_token"},
+		{"s.sh", "grep -rn 'needle' .   # find every needle\n", "needle"},
+		{"q.sql", "SELECT id FROM users WHERE role = 'admin';\n", "admin"},
+		{"c.yaml", "server:\n  listen: 0.0.0.0:8080\n  timeout: 30s\n", "timeout"},
+		{"t.ts", "export function debounce(fn: () => void) { return fn }\n", "debounce"},
+		{"b.js", "function debounce(fn) { return fn }\n", "debounce"},
+		{"a.rb", "def normalize_path(input)\n  input.strip\nend\n", "normalize_path"},
+		{"k.kt", "fun readFirstLine(path: String): String? = null\n", "readFirstLine"},
+	} {
+		dir := t.TempDir()
+		p := filepath.Join(dir, tc.name)
+		if err := os.WriteFile(p, []byte(tc.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		text, kind, err := Extract(p, filepath.Ext(tc.name))
+		if err != nil {
+			t.Errorf("%s: Extract: %v", tc.name, err)
+			continue
+		}
+		if kind != filepath.Ext(tc.name) {
+			t.Errorf("%s: got kind %q, want %q — its text was discarded", tc.name, kind, filepath.Ext(tc.name))
+		}
+		if !strings.Contains(text, tc.want) {
+			t.Errorf("%s: extracted text %q does not contain %q", tc.name, text, tc.want)
+		}
+	}
 }

@@ -20,12 +20,62 @@ type planItem struct {
 // It is only ever a description: nothing here has touched the filesystem.
 type organizePlan map[string][]planItem
 
+// organizeGroup is one destination folder's worth of the plan, in the order it
+// should be shown. A slice rather than the map makes presentation stable
+// between runs.
+type organizeGroup struct {
+	Category string
+	Items    []planItem
+}
+
+// organizePreview is a full, ordered tidy-up proposal. Building it touches
+// nothing on the filesystem; only Apply acts, and only when the caller asks.
+type organizePreview struct {
+	Dir    string
+	Count  int
+	Groups []organizeGroup
+	plan   organizePlan
+}
+
+// OrganizePlan walks dir and proposes where each file would go. It performs no
+// writes at all — the safety model keeps the decision and the action in
+// separate functions on purpose.
+func OrganizePlan(dir string) (organizePreview, error) {
+	files, stats, err := Scan(dir)
+	if err != nil {
+		return organizePreview{}, err
+	}
+	plan := organizePlan{}
+	for _, fi := range files {
+		cat := categorizeFor(fi.Ext, fi.Filename)
+		plan[cat] = append(plan[cat], planItem{srcPath: fi.Path, name: fi.Filename})
+	}
+	prev := organizePreview{Dir: dir, Count: stats.Indexed, plan: plan}
+	for _, cat := range sortedKeys(plan) {
+		prev.Groups = append(prev.Groups, organizeGroup{Category: cat, Items: plan[cat]})
+	}
+	return prev, nil
+}
+
+// Apply copies the planned files into destRoot. It never moves, deletes or
+// overwrites; collisions get a numeric suffix. See applyPlan.
+func (p organizePreview) Apply(destRoot string) (copied, skipped int, err error) {
+	return applyPlan(p.plan, destRoot)
+}
+
 // categorizeFor decides the destination folder name for a file.
 func categorizeFor(ext, filename string) string {
 	// OCR-able raster images, plus the two image formats OCR cannot read.
 	// Sharing one definition with the extractor keeps the two from drifting.
 	if imageExtensions[ext] || ext == ".svg" || ext == ".heic" {
 		return "Images"
+	}
+
+	// Same reasoning, same shared set. This used to be a hand-typed list of
+	// 17 extensions, which is precisely how source files ended up filed as
+	// code while the extractor refused to read them.
+	if codeExtensions[ext] {
+		return "Programming"
 	}
 
 	switch ext {
@@ -38,9 +88,6 @@ func categorizeFor(ext, filename string) string {
 		return "Videos"
 	case ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac":
 		return "Audio"
-	case ".go", ".c", ".cpp", ".h", ".hpp", ".py", ".rs", ".js", ".ts", ".java",
-		".rb", ".sh", ".sql", ".php", ".cs", ".swift", ".kt":
-		return "Programming"
 	case ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tgz":
 		return "Archives"
 	case ".deb", ".rpm", ".appimage", ".exe", ".msi", ".dmg", ".pkg":
@@ -67,28 +114,21 @@ func cmdOrganize(args []string, dbPath string) error {
 		destRoot = expandHome(into)
 	}
 
-	files, stats, err := Scan(dir)
+	prev, err := OrganizePlan(dir)
 	if err != nil {
 		return err
 	}
-	if len(files) == 0 {
+	if prev.Count == 0 {
 		fmt.Printf("Nothing to organize in %s.\n", prettyPath(dir))
 		return nil
 	}
 
-	plan := organizePlan{}
-	for _, fi := range files {
-		cat := categorizeFor(fi.Ext, fi.Filename)
-		plan[cat] = append(plan[cat], planItem{srcPath: fi.Path, name: fi.Filename})
-	}
+	fmt.Printf("Organization plan for %s\n", prettyPath(prev.Dir))
+	fmt.Printf("(%d files considered)\n\n", prev.Count)
 
-	fmt.Printf("Organization plan for %s\n", prettyPath(dir))
-	fmt.Printf("(%d files considered)\n\n", stats.Indexed)
-
-	for _, cat := range sortedKeys(plan) {
-		items := plan[cat]
-		fmt.Printf("%-28s %d file(s)\n", cat+"/", len(items))
-		for _, it := range items {
+	for _, g := range prev.Groups {
+		fmt.Printf("%-28s %d file(s)\n", g.Category+"/", len(g.Items))
+		for _, it := range g.Items {
 			fmt.Printf("    %s\n", it.name)
 		}
 		fmt.Println()
@@ -101,13 +141,13 @@ func cmdOrganize(args []string, dbPath string) error {
 		return nil
 	}
 
-	fmt.Printf("About to copy %d files into %s\n", stats.Indexed, prettyPath(destRoot))
+	fmt.Printf("About to copy %d files into %s\n", prev.Count, prettyPath(destRoot))
 	if !autoYes && !confirm("Proceed?") {
 		fmt.Println("Cancelled. Nothing was changed.")
 		return nil
 	}
 
-	copied, skipped, err := applyPlan(plan, destRoot)
+	copied, skipped, err := prev.Apply(destRoot)
 	if err != nil {
 		return err
 	}

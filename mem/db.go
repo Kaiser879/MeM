@@ -268,6 +268,15 @@ func (s *Store) Count() (int, error) {
 	return n, err
 }
 
+// Content returns the stored extracted text for one indexed file. It is what
+// the detail view shows when a result is opened. An empty string means the
+// file has no searchable text (a scanned PDF, a photo with no words).
+func (s *Store) Content(id int64) (string, error) {
+	var content sql.NullString
+	err := s.db.QueryRow(`SELECT content FROM files WHERE id = ?`, id).Scan(&content)
+	return content.String, err
+}
+
 // CountUnsearchable is how many indexed files we hold metadata for but no text:
 // scanned PDFs, images where OCR found nothing worth indexing, and formats we
 // cannot read at all.
@@ -284,13 +293,103 @@ func (s *Store) CountUnsearchable() (int, error) {
 	return n, err
 }
 
-// related finds memories that overlap with a given file.
+// CategoryStat is one row of the "by category" breakdown.
+type CategoryStat struct {
+	Name  string
+	Count int
+	Bytes int64
+}
+
+// ExtStat is one row of the "by file type" breakdown.
+type ExtStat struct {
+	Ext   string
+	Count int
+}
+
+// StatsData is a summary of what the index holds, as data rather than text so
+// that both the CLI and the TUI can present it.
+type StatsData struct {
+	Total      int
+	TotalBytes int64
+	Path       string
+	Categories []CategoryStat
+	Extensions []ExtStat
+}
+
+// Stats summarises the index: totals and a breakdown by category and by file
+// type. Empty categories and extensions are normalised for display here, not
+// at the call site, so every consumer shows the same label.
+func (s *Store) Stats() (StatsData, error) {
+	st := StatsData{Path: s.path}
+	n, err := s.Count()
+	if err != nil {
+		return st, err
+	}
+	st.Total = n
+	if n == 0 {
+		return st, nil
+	}
+
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(size),0) FROM files`).Scan(&st.TotalBytes)
+
+	catRows, err := s.db.Query(`SELECT category, COUNT(*), SUM(size)
+	                             FROM files GROUP BY category ORDER BY 2 DESC`)
+	if err != nil {
+		return st, err
+	}
+	for catRows.Next() {
+		var cat string
+		var c int
+		var sz int64
+		catRows.Scan(&cat, &c, &sz)
+		if cat == "" {
+			cat = "Uncategorised"
+		}
+		st.Categories = append(st.Categories, CategoryStat{Name: cat, Count: c, Bytes: sz})
+	}
+	catRows.Close()
+
+	extRows, err := s.db.Query(`SELECT extension, COUNT(*)
+	                            FROM files GROUP BY extension ORDER BY 2 DESC LIMIT 12`)
+	if err != nil {
+		return st, err
+	}
+	for extRows.Next() {
+		var ext string
+		var c int
+		extRows.Scan(&ext, &c)
+		if ext == "" {
+			ext = "(none)"
+		}
+		st.Extensions = append(st.Extensions, ExtStat{Ext: ext, Count: c})
+	}
+	extRows.Close()
+	return st, nil
+}
+
+// RelatedData is the result of a related lookup: the file we compared
+// against, the distinctive words that were used to compare, and the
+// documents that share them.
+//
+// It is deliberately a value rather than a printed table so that the CLI and
+// the TUI can render the same answer their own way. Terms is what
+// distinguishes "this file has no text to compare on" from "nothing else
+// shares vocabulary": the first has no Terms at all, the second has Terms
+// but an empty Hits slice.
+type RelatedData struct {
+	Target result
+	Terms  []string
+	Hits   []result
+}
+
+// Related finds memories that overlap with a given file.
 //
 // The idea: pull the words that define a document, then look for other
 // documents containing many of the same words. Overlapping vocabulary is a
 // good enough proxy for "these two are about the same thing" without
 // needing embeddings or a vector database.
-func (s *Store) related(query string) error {
+func (s *Store) Related(query string) (RelatedData, error) {
+	var data RelatedData
 	var target result
 	err := s.db.QueryRow(`
 		SELECT id, filename, path, category, extension, size, modified_at, content_type
@@ -300,22 +399,19 @@ func (s *Store) related(query string) error {
 		Scan(&target.ID, &target.Filename, &target.Path, &target.Category,
 			&target.Extension, &target.Size, &target.Modified, &target.ContentTy)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("%q is not in the index; run 'mem scan <dir>' first", query)
+		return data, fmt.Errorf("%q is not in the index; run 'mem scan <dir>' first", query)
 	}
 	if err != nil {
-		return err
+		return data, err
 	}
-
-	fmt.Printf("Memories related to %s\n\n", target.Filename)
-	fmt.Printf("  %s\n  category: %s · %s\n\n", prettyPath(target.Path),
-		target.Category, humanBytes(uint64(target.Size)))
+	data.Target = target
 
 	// Take a sample of the target's own text, keep the words that are rare
 	// across the whole index, and find documents sharing those words.
 	terms := distinctiveTerms(s, target.ID)
+	data.Terms = terms
 	if len(terms) == 0 {
-		fmt.Println("  (this file has no extracted text to compare on)")
-		return nil
+		return data, nil
 	}
 
 	rows, err := s.db.Query(`
@@ -326,31 +422,25 @@ func (s *Store) related(query string) error {
 		ORDER BY bm25(files_fts, 4.0, 1.0, 2.0, 3.0)
 		LIMIT 12`, ftsQuery(terms))
 	if err != nil {
-		return err
+		return data, err
 	}
 	defer rows.Close()
 
-	shown := 0
 	for rows.Next() {
 		var r result
 		if err := rows.Scan(&r.ID, &r.Filename, &r.Path, &r.Extension,
 			&r.Size, &r.Modified); err != nil {
-			return err
+			return data, err
 		}
 		if r.ID == target.ID {
 			continue
 		}
-		fmt.Printf("  %-44s %s · %s\n", truncate(r.Filename, 44),
-			humanBytes(uint64(r.Size)), timeAgo(r.Modified))
-		shown++
+		data.Hits = append(data.Hits, r)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return data, err
 	}
-	if shown == 0 {
-		fmt.Println("  (nothing else in the index shares vocabulary with this file)")
-	}
-	return nil
+	return data, nil
 }
 
 // distinctiveTerms picks the words that best characterise one document.

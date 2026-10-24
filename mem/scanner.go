@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -130,4 +131,120 @@ func Scan(root string) ([]FileInfo, ScanStats, error) {
 	stats.Indexed = len(out)
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, stats, nil
+}
+
+// ScanProgress is a snapshot of an in-flight scan, handed to a progress
+// callback after each file so a UI can draw a bar without guessing.
+type ScanProgress struct {
+	Done  int    // files processed so far this pass
+	Total int    // files the walk discovered
+	Path  string // the file just finished, if any
+}
+
+// ScanReport is what a completed scan did, as data. The CLI formats it into
+// its usual lines; the TUI renders the same numbers its own way.
+type ScanReport struct {
+	Dir          string
+	Indexed      int
+	Extracted    int
+	Unchanged    int
+	Pruned       []string
+	SkippedLarge int
+	SkippedMeta  int
+	OCR          ocrStats
+	Total        int
+	DBPath       string
+}
+
+// ScanAndIndex walks dir, extracts text from changed files, and writes them to
+// the index. progress, when non-nil, is called once up front and then after
+// every file; it must be cheap and must not touch the store.
+//
+// This is the whole of what `mem scan` does, lifted out of cmdScan so that the
+// TUI can run the exact same pipeline with a progress bar instead of a
+// transcript. The indexing rules are unchanged: extraction failures are never
+// fatal, unchanged files are skipped unless force is set, and rows whose files
+// have vanished are pruned.
+func (s *Store) ScanAndIndex(dir string, force bool, progress func(ScanProgress)) (ScanReport, error) {
+	rep := ScanReport{Dir: dir, DBPath: s.Path()}
+
+	files, stats, err := Scan(dir)
+	if err != nil {
+		return rep, err
+	}
+	rep.SkippedLarge = stats.SkippedLarge
+	rep.SkippedMeta = stats.SkippedMeta
+
+	// Every path the walk produced, including the ones we are about to skip as
+	// unchanged. PruneMissing compares against this set to spot rows whose
+	// files have since been deleted.
+	seen := make(map[string]bool, len(files))
+	for _, fi := range files {
+		seen[fi.Path] = true
+	}
+
+	total := len(files)
+	if progress != nil {
+		progress(ScanProgress{Done: 0, Total: total})
+	}
+
+	resetOCRStats()
+
+	for i, fi := range files {
+		// Skip work entirely when size and mtime match what we stored. This
+		// is what makes a second scan feel instant.
+		if !force {
+			if prev, found, err := s.Lookup(fi.Path); err == nil && found {
+				if prev.Size == fi.Size && prev.Modified == fi.ModifiedAt {
+					rep.Unchanged++
+					if progress != nil {
+						progress(ScanProgress{Done: i + 1, Total: total, Path: fi.Path})
+					}
+					continue
+				}
+			}
+		}
+
+		text, kind, xerr := Extract(fi.Path, fi.Ext)
+		if xerr != nil {
+			// Extraction problems are never fatal: the file still gets indexed
+			// by name, size and timestamp, so it stays findable.
+			text, kind = "", "meta"
+		}
+		if strings.TrimSpace(text) == "" {
+			// Extracted nothing usable: record it as metadata-only.
+			text, kind = "", "meta"
+		}
+		if kind != "meta" {
+			rep.Extracted++
+		}
+
+		cat := categoryFor(fi.Ext, fi.Filename)
+		if err := s.Upsert(fi, text, kind, cat, hashFile(fi.Path)); err != nil {
+			return rep, fmt.Errorf("index %s: %w", fi.Path, err)
+		}
+		rep.Indexed++
+		if progress != nil {
+			progress(ScanProgress{Done: i + 1, Total: total, Path: fi.Path})
+		}
+	}
+
+	// Drop rows for files that have been deleted since the last scan. Scoped to
+	// the folder just walked, and only reached because Scan returned without
+	// error — a walk that could not read the tree tells us nothing about what is
+	// missing from it, so pruning on a partial walk would delete live rows.
+	absRoot, err := filepath.Abs(dir)
+	if err != nil {
+		return rep, err
+	}
+	pruned, err := s.PruneMissing(absRoot, seen)
+	if err != nil {
+		return rep, fmt.Errorf("prune missing files: %w", err)
+	}
+	rep.Pruned = pruned
+	rep.OCR = ocrCounts
+
+	total2, _ := s.Count()
+	rep.Total = total2
+	return rep, nil
 }

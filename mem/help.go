@@ -31,6 +31,7 @@ QUICK START
 COMMANDS
   scan <dir>              Index every file under <dir>. Reads only.
   search <query>          Find files by description. Alias: find.
+  ui                      Browse and search the index in a terminal interface.
   organize <dir>          Preview a tidy-up plan. Alias: organise.
   related <filename>      Find documents that overlap with one you have.
   stats                   Summarise what is currently indexed.
@@ -160,6 +161,29 @@ does not read file contents to decide where something belongs.
   Re-run with --apply to copy files into the folder structure.
 `,
 
+	"ui": `mem ui [flags]
+
+Opens the index in a terminal interface. You can search by description, open a
+result to read its stored text, find related files, scan a new folder with a
+live progress bar, and preview an organize plan — all without leaving the app.
+
+  --db <path>     index to browse
+  --limit, -n N   maximum results per search (default 10)
+  --type, -t ext  start with a file-type filter, e.g. --type pdf
+
+Keys
+  type to search; enter searches now; esc leaves the input for commands
+  ↑/↓ move          enter open a result
+  r related        i scan a folder
+  o organize       s stats
+  ? help           ctrl+c quit
+
+The interface only reads: a search and a scan never write, and organize shows
+a preview until you explicitly press a to copy. It runs in the alternate
+screen and restores your terminal on exit.
+
+  $ mem ui
+`,
 	"related": `mem related <filename>
 
 Finds documents that share distinctive vocabulary with a file you already
@@ -266,5 +290,5 @@ func printCommandHelp(command string) error {
 // helpTopics lists command names in help order, not map order, so the output
 // is stable between runs.
 func helpTopics() []string {
-	return []string{"scan", "search", "organize", "related", "stats", "help", "version"}
+	return []string{"scan", "search", "ui", "organize", "related", "stats", "help", "version"}
 }
