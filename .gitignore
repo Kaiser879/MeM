@@ -10,3 +10,6 @@ mem/mem
 # Stray tesseract output. An empty output base writes OCR garbage to a file
 # instead of stdout; this is what that looks like when it happens by accident.
 .mem-ocr-*
+
+# Local working notes. Personal context, not part of the published project.
+mem_hackathon_ai_instructions.md
