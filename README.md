@@ -1,4 +1,10 @@
-# mem — find files by what you remember, not what they're named
+# mem
+
+**Find files by what you remember, not what they're named.**
+
+[![CI](https://github.com/Kaiser879/MeM/actions/workflows/ci.yml/badge.svg)](https://github.com/Kaiser879/MeM/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/go-1.27%2B-00ADD8?logo=go)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 > **"Information You Have, But Can't Find When You Need It"**
 
@@ -6,7 +12,8 @@ You know the document exists. You know roughly what it says. You have no idea
 what it's called or which folder it ended up in.
 
 `mem` indexes a folder, reads the text *inside* the files, and lets you search
-by memory instead of by filename.
+by memory instead of by filename. Local-first: one SQLite file, no server, no
+network calls, no AI API.
 
 ```console
 $ mem search "the PDF about Linux process scheduling"
@@ -31,12 +38,17 @@ Understood as:
 
 ## Install
 
-Requires Go 1.21+.
+Requires Go 1.27+ and nothing else running. SQLite is pure Go, so there is no
+cgo and no database to install.
 
 ```bash
-cd mem
+git clone git@github.com:Kaiser879/MeM.git
+cd MeM
 go build -o mem .
 ```
+
+Optional system tools are detected at runtime: `pdftotext` (better PDF text)
+and `tesseract` (OCR for images). Without them the tool still works.
 
 ## Use
 
@@ -49,14 +61,14 @@ mem related "1st Year Syllabus.pdf"   # find related memories
 mem stats                             # what is indexed
 ```
 
-**New to this? Start with [TUTORIAL.md](TUTORIAL.md)** — a 15-minute
+**New to this? Start with [docs/TUTORIAL.md](docs/TUTORIAL.md)** — a 15-minute
 walkthrough from build to demo, including what the tool cannot do and how to
 explain it to someone asking questions.
 
-**Presenting it? Keep [HOW-IT-WORKS.md](HOW-IT-WORKS.md)** open. It explains what
-each command does underneath — the FTS5 schema and its triggers, bm25 weights,
-the query parser step by step, the OCR quality gate — with the SQLite queries
-that prove each claim live.
+**Presenting it? Keep [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)** open. It
+explains what each command does underneath — the FTS5 schema and its triggers,
+bm25 weights, the query parser step by step, the OCR quality gate — with the
+SQLite queries that prove each claim live.
 
 ### Commands
 
@@ -308,7 +320,7 @@ Honest about what this does not do:
 ## Project layout
 
 ```
-mem/
+.
 ├── main.go        CLI dispatch, scan, stats, related
 ├── help.go        overview and per-command help
 ├── db.go          schema, upserts, incremental logic, related, stats
@@ -322,9 +334,12 @@ mem/
 ├── mem_test.go    parser, ranking, OCR-gate, help, and safety tests
 ├── ui_test.go     TUI model, key routing, and per-screen render tests
 ├── demo.sh        three-beat demo script
-├── README.md      this file — design rationale and limitations
-├── TUTORIAL.md    hands-on walkthrough, start here
-└── HOW-IT-WORKS.md  technical companion: what each command does underneath
+├── docs/
+│   ├── TUTORIAL.md      hands-on walkthrough, start here
+│   └── HOW-IT-WORKS.md  technical companion: what each command does underneath
+├── .github/workflows/ci.yml  build, vet, and test on every push
+├── LICENSE        MIT
+└── README.md      this file — design rationale and limitations
 ```
 
 ```bash

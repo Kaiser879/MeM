@@ -1,5 +1,6 @@
 # The compiled binary. Rebuild with: go build -o mem .
-mem/mem
+/mem
+/mem.exe
 
 # The live index. It is a cache of your files, not your files:
 # delete it and the next scan rebuilds it. Never commit it.
@@ -13,3 +14,9 @@ mem/mem
 
 # Local working notes. Personal context, not part of the published project.
 mem_hackathon_ai_instructions.md
+
+# Editor and OS clutter.
+.DS_Store
+*.swp
+.idea/
+.vscode/

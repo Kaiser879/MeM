@@ -43,7 +43,8 @@ That is the whole product in one screenshot.
 ## Step 0 — Build it
 
 ```bash
-cd mem
+git clone git@github.com:Kaiser879/MeM.git
+cd MeM
 go build -o mem .
 ```
 
@@ -645,4 +646,4 @@ No other state. Nothing is written outside the index file and the folders
   underneath each command: the FTS5 schema and its triggers, bm25 weights, the
   query parser step by step, the OCR quality gate and why it exists, and the
   SQLite queries that prove any of it live. Worth keeping open while you demo.
-- **[README.md](README.md)** — design rationale and limitations.
+- **[README.md](../README.md)** — design rationale and limitations.
