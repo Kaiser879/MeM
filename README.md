@@ -104,6 +104,8 @@ The tool is deliberately incapable of destroying your data:
 
 ## Terminal interface
 
+![mem ui: a search for "the ocr quality gate for handwriting" returning three notes, with the matched words highlighted](docs/ui.png)
+
 `mem ui` opens the index in a full-screen terminal interface built with
 [Bubble Tea](https://github.com/charmbracelet/bubbletea). It is the same index
 and the same search the CLI uses, with navigation on top.
@@ -336,7 +338,8 @@ Honest about what this does not do:
 ├── demo.sh        three-beat demo script
 ├── docs/
 │   ├── TUTORIAL.md      hands-on walkthrough, start here
-│   └── HOW-IT-WORKS.md  technical companion: what each command does underneath
+│   ├── HOW-IT-WORKS.md  technical companion: what each command does underneath
+│   └── ui.png           screenshot of the terminal interface
 ├── .github/workflows/ci.yml  build, vet, and test on every push
 ├── LICENSE        MIT
 └── README.md      this file — design rationale and limitations
